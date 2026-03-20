@@ -395,3 +395,274 @@ def extract_citations(answer: str, chunks: list[dict]) -> list[dict]:
 pytest tests/test_generation.py -v
 ruff check src/generation/ tests/test_generation.py
 ```
+
+---
+
+---
+
+## Module 8 — FastAPI Endpoint
+
+### Files to create
+
+| File | Why |
+|------|-----|
+| `app/schemas.py` | Pydantic models for all request/response shapes |
+| `app/main.py` | FastAPI app with `/ask` and `/health` endpoints |
+| `tests/test_api.py` | Full endpoint tests using `TestClient` and dependency overrides — no real services |
+
+---
+
+### Context from previous modules
+
+`RetrievalPipeline.retrieve(query, top_k, filters)` returns:
+```python
+[{"chunk_text": str, "metadata": dict, "score": float, "reranker_score": float}, ...]
+```
+
+`should_refuse(chunks) -> bool` — True when chunks is empty or max `score` < `similarity_threshold`.
+
+`build_prompt(query, chunks) -> str` — returns `""` for empty chunks.
+
+`LLMClient.generate(prompt) -> str` — returns stripped LLM response.
+
+`extract_citations(answer, chunks) -> list[dict]` — returns `[{"claim", "source_chunk", "page_number", "source_document"}, ...]`.
+
+`QdrantStore.get_collection_info()` — returns a Qdrant `CollectionInfo` object (`.vectors_count`, `.points_count`, `.status`).
+
+---
+
+### `app/schemas.py`
+
+Four Pydantic models:
+
+```python
+class AskRequest(BaseModel):
+    question: str
+    filters: dict | None = None
+
+class CitationSource(BaseModel):
+    claim: str
+    source_chunk: str
+    page_number: int | None
+    source_document: str
+
+class AskResponse(BaseModel):
+    answer: str
+    sources: list[CitationSource]
+    confidence: float       # max cosine score from retrieval; 0.0 on refusal
+    model_version: str      # Settings.llm_model
+
+class HealthResponse(BaseModel):
+    status: str             # "ok" or "degraded"
+    model_version: str
+    collection_info: dict   # vectors_count, points_count, status from Qdrant
+```
+
+`CitationSource` mirrors the dict shape returned by `extract_citations`, allowing
+`AskResponse.sources` to be typed rather than `list[dict]`.
+
+---
+
+### `app/main.py`
+
+#### Dependency functions (for testability)
+
+FastAPI's `Depends()` system lets tests override dependencies without monkeypatching
+module globals. Three thin wrapper functions are defined at module level:
+
+```python
+def _get_pipeline() -> RetrievalPipeline:
+    from src.retrieval.pipeline import get_pipeline
+    return get_pipeline()
+
+def _get_llm_client() -> LLMClient:
+    from src.generation.llm_client import get_llm_client
+    return get_llm_client()
+
+def _get_store() -> QdrantStore:
+    from src.retrieval.vector_store import get_store
+    return get_store()
+```
+
+Tests swap them with `app.dependency_overrides[_get_pipeline] = lambda: mock`.
+
+#### `POST /ask` — orchestration logic
+
+```
+1. Validate AskRequest (Pydantic handles type errors → 422 automatically)
+2. Strip and check question — raise HTTPException(400) if empty after strip
+3. pipeline.retrieve(question, top_k=settings.top_k_rerank, filters=filters)
+4. should_refuse(chunks) → if True:
+       return AskResponse(
+           answer="I cannot answer from the provided documents.",
+           sources=[],
+           confidence=max(c["score"] for c in chunks) if chunks else 0.0,
+           model_version=settings.llm_model,
+       )
+5. prompt = build_prompt(question, chunks)
+6. answer = llm_client.generate(prompt)
+7. citations = extract_citations(answer, chunks)
+8. confidence = max(c["score"] for c in chunks)
+9. return AskResponse(answer=answer, sources=citations,
+                      confidence=confidence, model_version=settings.llm_model)
+```
+
+Wrap steps 3–9 in `try/except`:
+- `ConnectionError` → `HTTPException(503, detail="Vector store unavailable")`
+- Any other `Exception` → `HTTPException(500, detail="Internal server error")`
+
+Logging: INFO at entry (question length, filters), INFO at exit (answer length, num sources, confidence).
+
+#### `GET /health`
+
+```
+1. settings = get_settings()
+2. try:
+       info = store.get_collection_info()
+       collection_info = {
+           "name": settings.collection_name,
+           "vectors_count": info.vectors_count,
+           "points_count": info.points_count,
+           "status": str(info.status),
+       }
+       status = "ok"
+   except ConnectionError:
+       collection_info = {"error": "Qdrant unavailable"}
+       status = "degraded"
+3. return HealthResponse(status=status, model_version=settings.llm_model,
+                         collection_info=collection_info)
+```
+
+Always returns 200 — health endpoints must not raise 5xx or load balancers
+will drop the instance. Callers inspect the `status` field to detect degradation.
+
+---
+
+### Error handling strategy
+
+| Scenario | HTTP code | How triggered |
+|---|---|---|
+| Empty/whitespace `question` | 400 | Explicit `HTTPException(400)` before pipeline call |
+| Pydantic type mismatch | 422 | FastAPI automatic validation |
+| Qdrant unreachable | 503 | `except ConnectionError` wrapping `pipeline.retrieve` |
+| Any other unexpected error | 500 | `except Exception` catch-all in `/ask` |
+| Refusal (low similarity) | 200 | Valid answer, just the refusal phrase — not an error |
+
+A custom `exception_handler` is **not** needed — `HTTPException` already produces
+structured JSON `{"detail": "..."}` responses, which is sufficient for this stage.
+
+---
+
+### Testing strategy — `tests/test_api.py`
+
+**No real services.** `TestClient` (Starlette, included with FastAPI) runs the ASGI
+app in-process. Dependencies are replaced with lightweight fakes:
+
+```python
+@pytest.fixture
+def mock_pipeline():
+    m = MagicMock()
+    m.retrieve.return_value = _make_chunks(2)   # reuse helper from test_generation.py
+    return m
+
+@pytest.fixture
+def mock_llm():
+    m = MagicMock()
+    m.generate.return_value = "The dose is 25 mg [1]."
+    m.model = "llama-3.3-70b-versatile"
+    return m
+
+@pytest.fixture
+def client(mock_pipeline, mock_llm):
+    from app.main import app, _get_pipeline, _get_llm_client
+    app.dependency_overrides[_get_pipeline] = lambda: mock_pipeline
+    app.dependency_overrides[_get_llm_client] = lambda: mock_llm
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+```
+
+The `mock_pipeline` fixture returns pre-built chunks with `score=0.9` (above threshold),
+so the default path exercises the full happy path without any model loading.
+
+#### Tests planned
+
+**`/ask` happy path**
+
+| Test | What it checks |
+|------|----------------|
+| `test_ask_returns_200` | Status code 200 |
+| `test_ask_response_has_answer` | `response["answer"]` is a non-empty string |
+| `test_ask_response_has_sources` | `response["sources"]` is a list |
+| `test_ask_response_has_confidence` | `response["confidence"]` is a float |
+| `test_ask_response_has_model_version` | `response["model_version"]` is present |
+| `test_ask_passes_question_to_pipeline` | `pipeline.retrieve` called with the question |
+| `test_ask_passes_filters_to_pipeline` | `filters` dict forwarded to `pipeline.retrieve` |
+| `test_ask_sources_populated_from_citations` | `[1]` in answer → `sources` list has one entry |
+| `test_ask_confidence_is_max_score` | `confidence == 0.9` (max of chunk scores) |
+
+**`/ask` refusal path**
+
+| Test | What it checks |
+|------|----------------|
+| `test_ask_refusal_returns_200` | Refusal is a 200, not an error |
+| `test_ask_refusal_answer_text` | `answer` equals the refusal phrase |
+| `test_ask_refusal_empty_sources` | `sources == []` |
+| `test_ask_refusal_confidence_zero` | `confidence == 0.0` when no chunks |
+
+**`/ask` error paths**
+
+| Test | What it checks |
+|------|----------------|
+| `test_ask_empty_question_returns_400` | `""` question → 400 |
+| `test_ask_whitespace_question_returns_400` | `"   "` question → 400 |
+| `test_ask_pipeline_connection_error_returns_503` | `pipeline.retrieve` raises `ConnectionError` → 503 |
+| `test_ask_pipeline_unexpected_error_returns_500` | `pipeline.retrieve` raises `RuntimeError` → 500 |
+
+**`/health`**
+
+| Test | What it checks |
+|------|----------------|
+| `test_health_returns_200` | Status code 200 |
+| `test_health_status_ok` | `response["status"] == "ok"` when store responds |
+| `test_health_model_version` | `response["model_version"]` matches settings |
+| `test_health_collection_info_present` | `response["collection_info"]` is a dict |
+| `test_health_degraded_when_store_unavailable` | `status == "degraded"` when store raises `ConnectionError` |
+
+Total: **~22 tests**.
+
+---
+
+### Architecture decisions
+
+1. **`Depends()` over monkeypatching** — FastAPI's dependency injection is the
+   standard pattern for overriding services in tests. It's explicit and doesn't
+   risk leaking state between tests via module globals.
+
+2. **503 for Qdrant unavailability, not 500** — `ConnectionError` from the store
+   is a known failure mode (Qdrant container not running). 503 signals "service
+   unavailable" to clients and load balancers more accurately than 500.
+
+3. **Refusal is 200, not 4xx** — the system understood the question and searched
+   the corpus; it just lacked sufficient evidence. This is a valid answer, not a
+   client or server error.
+
+4. **`CitationSource` Pydantic model** — typing `sources` as `list[CitationSource]`
+   rather than `list[dict]` gives automatic validation, OpenAPI schema generation,
+   and IDE support for consumers of the API.
+
+5. **Lazy imports inside dependency functions** — `_get_pipeline()` imports inside
+   the function body to avoid loading ML models at import time (same pattern as
+   `RetrievalPipeline.__init__`). This keeps the test suite fast.
+
+6. **No streaming** — `/ask` returns the full response. Streaming (SSE/WebSocket)
+   is a potential future enhancement but out of scope for Module 8.
+
+---
+
+### Verification
+
+```bash
+pytest tests/test_api.py -v
+ruff check app/ tests/test_api.py
+```
