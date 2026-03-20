@@ -666,3 +666,337 @@ Total: **~22 tests**.
 pytest tests/test_api.py -v
 ruff check app/ tests/test_api.py
 ```
+
+---
+
+---
+
+## Module 9 — RAGAS Evaluation
+
+### Files to create
+
+| File | Why |
+|------|-----|
+| `src/evaluation/test_queries.json` | 20+ medical Q&A pairs with ground truth answers |
+| `src/evaluation/ragas_eval.py` | Run RAGAS (faithfulness + answer_relevancy) across all test queries |
+| `src/evaluation/chunking_comparison.py` | Run same queries across all 3 chunking strategies, compare RAGAS scores |
+| `tests/test_evaluation.py` | Lightweight tests — mocked pipeline/LLM/RAGAS; no real API calls |
+
+---
+
+### RAGAS 0.4.x API notes
+
+RAGAS 0.4.3 is installed. Key API facts discovered by inspection:
+
+**Metrics require an LLM at construction time:**
+```python
+from ragas.llms import llm_factory
+from openai import OpenAI
+
+ragas_llm = llm_factory(
+    "llama-3.3-70b-versatile",
+    provider="openai",
+    client=OpenAI(api_key=groq_api_key, base_url="https://api.groq.com/openai/v1"),
+)
+
+from ragas.metrics.collections.faithfulness import Faithfulness
+from ragas.metrics.collections.answer_relevancy import AnswerRelevancy
+
+metrics = [Faithfulness(llm=ragas_llm), AnswerRelevancy(llm=ragas_llm)]
+```
+
+**Dataset schema (`SingleTurnSample` fields used):**
+- `user_input` — the question
+- `response` — LLM-generated answer
+- `retrieved_contexts` — list of chunk texts passed to the LLM
+- `reference` — ground truth answer (used by some metrics)
+
+**`evaluate()` call:**
+```python
+from ragas import evaluate
+from ragas.run_config import RunConfig
+
+result = evaluate(
+    dataset=eval_dataset,
+    metrics=metrics,
+    run_config=RunConfig(max_retries=10, max_wait=60, timeout=180),
+    batch_size=5,          # limits concurrent requests
+    raise_exceptions=False,  # returns NaN on failures, never crashes
+)
+df = result.to_pandas()
+```
+
+---
+
+### `src/evaluation/test_queries.json`
+
+A JSON array of 20+ entries. Each entry:
+
+```json
+{
+    "id": "q001",
+    "category": "dosing",
+    "question": "What is the recommended starting dose of amitriptyline for pain management?",
+    "ground_truth": "The recommended starting dose of amitriptyline for pain management is 10–25 mg at night.",
+    "expected_source_keywords": ["amitriptyline", "dose", "palliative"]
+}
+```
+
+**Fields:**
+- `id` — unique identifier for tracking results per query
+- `category` — topic tag (`dosing`, `contraindications`, `indications`, `mechanism`, `monitoring`, `interactions`) for per-category breakdowns
+- `question` — natural language query sent to the RAG pipeline
+- `ground_truth` — reference answer for RAGAS `reference` field
+- `expected_source_keywords` — used in lightweight tests to verify the JSON is well-formed (not used by RAGAS)
+
+**20 question categories covered:**
+- 5× dosing (amitriptyline, metformin, insulin, morphine, aspirin)
+- 4× contraindications (β-blockers, NSAIDs, warfarin, lithium)
+- 4× indications (WHO essential medicines categories)
+- 3× mechanism of action
+- 2× drug monitoring (INR, renal function)
+- 2× drug interactions
+
+All questions are grounded in WHO Essential Medicines List and standard clinical
+guidelines — the same corpus ingested in Module 1.
+
+---
+
+### `src/evaluation/ragas_eval.py`
+
+**Public API:**
+
+```python
+def load_test_queries(path: str | Path) -> list[dict]:
+    """Load and return test query entries from a JSON file."""
+
+def run_rag_pipeline(
+    queries: list[dict],
+    pipeline: RetrievalPipeline,
+    llm_client: LLMClient,
+) -> list[dict]:
+    """Run each query through retrieve → generate; return result records."""
+
+def build_eval_dataset(results: list[dict]) -> EvaluationDataset:
+    """Convert pipeline results into a RAGAS EvaluationDataset."""
+
+def run_ragas(
+    dataset: EvaluationDataset,
+    ragas_llm: InstructorBaseRagasLLM,
+) -> pd.DataFrame:
+    """Run faithfulness + answer_relevancy; return scores as a DataFrame."""
+
+def save_results(df: pd.DataFrame, output_dir: str | Path) -> tuple[Path, Path]:
+    """Save scores to CSV and a bar chart PNG; return (csv_path, chart_path)."""
+
+def main() -> None:
+    """CLI entry point: load queries, run eval, save outputs."""
+```
+
+**`run_rag_pipeline` — result record shape:**
+```python
+{
+    "id":                str,   # query id
+    "category":          str,   # query category
+    "question":          str,   # user question
+    "ground_truth":      str,   # reference answer
+    "answer":            str,   # LLM response (or refusal phrase)
+    "retrieved_contexts": list[str],  # chunk texts passed to prompt
+    "refused":           bool,  # True if should_refuse() fired
+    "max_score":         float, # max cosine similarity
+}
+```
+
+If `should_refuse()` is True the answer is set to
+`"I cannot answer from the provided documents."` and the record is still
+included (RAGAS will give it low faithfulness/relevancy scores, which is
+the correct signal).
+
+**`build_eval_dataset` — mapping to `SingleTurnSample`:**
+
+| Result field | SingleTurnSample field |
+|---|---|
+| `question` | `user_input` |
+| `answer` | `response` |
+| `retrieved_contexts` | `retrieved_contexts` |
+| `ground_truth` | `reference` |
+
+**`save_results` — output files:**
+- `reports/figures/ragas_results_{timestamp}.csv` — one row per query with
+  `id`, `category`, `faithfulness`, `answer_relevancy`
+- `reports/figures/ragas_scores_{timestamp}.png` — horizontal bar chart
+  showing mean faithfulness and answer_relevancy with individual query dots
+
+---
+
+### `src/evaluation/chunking_comparison.py`
+
+**Assumption:** three Qdrant collections must already be ingested before
+running this script, one per strategy:
+
+| Strategy | Default collection name |
+|---|---|
+| `fixed_size` | `medical_docs_fixed` |
+| `sentence` | `medical_docs_sentence` |
+| `semantic` | `medical_docs_semantic` |
+
+Collection names are passed as a dict argument (or read from env vars
+`COLLECTION_FIXED`, `COLLECTION_SENTENCE`, `COLLECTION_SEMANTIC`) so users
+can override them without changing code.
+
+**Public API:**
+
+```python
+def evaluate_strategy(
+    strategy_name: str,
+    collection_name: str,
+    queries: list[dict],
+    llm_client: LLMClient,
+    ragas_llm: InstructorBaseRagasLLM,
+) -> pd.DataFrame:
+    """Run the full eval loop for one chunking strategy; return scores DF."""
+
+def run_comparison(
+    collections: dict[str, str],
+    queries: list[dict],
+    llm_client: LLMClient,
+    ragas_llm: InstructorBaseRagasLLM,
+) -> pd.DataFrame:
+    """Run evaluate_strategy for all strategies; return combined DF."""
+
+def save_comparison(df: pd.DataFrame, output_dir: str | Path) -> tuple[Path, Path]:
+    """Save comparison CSV + grouped bar chart."""
+
+def main() -> None:
+    """CLI entry point."""
+```
+
+**`run_comparison` — combined DataFrame shape:**
+```
+strategy | faithfulness_mean | answer_relevancy_mean | faithfulness_std | answer_relevancy_std
+```
+
+**`save_comparison` — output files:**
+- `reports/figures/chunking_comparison_{timestamp}.csv`
+- `reports/figures/chunking_comparison_{timestamp}.png` — grouped bar chart:
+  - X axis: chunking strategy (fixed_size, sentence, semantic)
+  - Two bars per group: faithfulness (blue) and answer_relevancy (orange)
+  - Error bars: ± 1 std dev
+
+Each strategy is evaluated sequentially (not in parallel) to stay within
+Groq's free-tier rate limit.
+
+---
+
+### Groq rate limiting strategy
+
+Groq free tier allows ~30 requests/minute.  Each RAGAS metric call makes
+multiple internal LLM requests per sample.
+
+**Mitigations baked into both scripts:**
+
+1. `RunConfig(max_retries=10, max_wait=60, timeout=180)` — RAGAS retries with
+   exponential backoff on rate-limit errors (HTTP 429).
+2. `evaluate(..., batch_size=5, raise_exceptions=False)` — limits concurrent
+   requests; NaN on individual failures rather than crashing the whole run.
+3. `sleep_between_queries: float = 1.0` parameter in `run_rag_pipeline` —
+   adds a 1-second pause between pipeline calls (before RAGAS).  Configurable
+   so users can increase it on the free tier.
+4. Sequential strategy evaluation in `chunking_comparison.py` with a
+   `sleep_between_strategies: float = 10.0` pause between strategies.
+
+---
+
+### Testing strategy — `tests/test_evaluation.py`
+
+**Key principle:** RAGAS `evaluate()` makes real LLM API calls — it cannot
+be fully unit-tested without a running Groq key. All tests mock it.
+
+**Fixtures:**
+```python
+@pytest.fixture
+def sample_queries():
+    return [{"id": "q1", "category": "dosing",
+              "question": "What is the dose?",
+              "ground_truth": "25 mg.", "expected_source_keywords": ["dose"]}]
+
+@pytest.fixture
+def sample_results(sample_queries):
+    return [{**q, "answer": "The dose is 25 mg.", "refused": False,
+             "max_score": 0.85, "retrieved_contexts": ["Context text."]}
+            for q in sample_queries]
+```
+
+#### `ragas_eval` tests
+
+| Test | What it checks |
+|------|----------------|
+| `test_load_test_queries_returns_list` | Return type is `list` |
+| `test_load_test_queries_has_required_fields` | Each entry has `id`, `question`, `ground_truth`, `category` |
+| `test_load_test_queries_count` | At least 20 entries in the shipped JSON |
+| `test_run_rag_pipeline_calls_retrieve` | `pipeline.retrieve` called once per query |
+| `test_run_rag_pipeline_calls_generate` | `llm_client.generate` called for non-refused queries |
+| `test_run_rag_pipeline_result_fields` | Each result has `answer`, `retrieved_contexts`, `refused` |
+| `test_run_rag_pipeline_refusal_sets_flag` | When `should_refuse` fires, `refused=True` and no LLM call |
+| `test_build_eval_dataset_type` | Returns `EvaluationDataset` instance |
+| `test_build_eval_dataset_sample_count` | One sample per result |
+| `test_build_eval_dataset_user_input` | `user_input` matches question |
+| `test_build_eval_dataset_response` | `response` matches answer |
+| `test_build_eval_dataset_contexts` | `retrieved_contexts` is a list of strings |
+| `test_save_results_creates_csv` | CSV file exists after call |
+| `test_save_results_creates_chart` | PNG file exists after call |
+| `test_save_results_csv_columns` | CSV has `faithfulness` and `answer_relevancy` columns |
+
+#### `chunking_comparison` tests
+
+| Test | What it checks |
+|------|----------------|
+| `test_run_comparison_calls_all_strategies` | `evaluate_strategy` called 3 times |
+| `test_run_comparison_result_has_strategy_column` | `strategy` column present in output DF |
+| `test_save_comparison_creates_csv` | Comparison CSV file exists |
+| `test_save_comparison_creates_chart` | Comparison PNG file exists |
+| `test_save_comparison_all_strategies_in_csv` | All 3 strategy names in CSV |
+
+Total: **~20 tests**.
+
+---
+
+### Architecture decisions
+
+1. **`llm_factory` over `LangchainLLMWrapper`** — `LangchainLLMWrapper` is
+   deprecated in RAGAS 0.4.x. Use `llm_factory(model, provider, client=OpenAI(...))`
+   which is the officially recommended path and returns an `InstructorBaseRagasLLM`.
+
+2. **Same Groq key, different client** — RAGAS uses its own OpenAI client
+   instance (separate from the `LLMClient` in Module 7). Both share the same
+   `GROQ_API_KEY` from Settings but are independent objects.
+
+3. **Scripts, not importable modules** — `ragas_eval.py` and
+   `chunking_comparison.py` have `main()` entry points runnable as
+   `python -m src.evaluation.ragas_eval`. All heavy logic is in named
+   functions so tests can import and mock them directly.
+
+4. **`raise_exceptions=False`** — ensures a single rate-limit failure on one
+   query doesn't abort the entire eval run. NaN scores are preserved in the CSV
+   so the analyst can see which queries failed.
+
+5. **Timestamp in output filenames** — prevents accidental overwrite when re-running
+   eval after tuning the pipeline.
+
+6. **`test_queries.json` ships in-repo** — ground truth answers are static
+   reference data, not generated. Version-controlled alongside the code so
+   any change to the question set is visible in git diff.
+
+---
+
+### Verification
+
+```bash
+# Lightweight tests (no API calls)
+pytest tests/test_evaluation.py -v
+ruff check src/evaluation/ tests/test_evaluation.py
+
+# Full eval run (requires Qdrant + GROQ_API_KEY):
+# python -m src.evaluation.ragas_eval
+# python -m src.evaluation.chunking_comparison
+```

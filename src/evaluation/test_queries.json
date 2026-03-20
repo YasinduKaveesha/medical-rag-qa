@@ -1,0 +1,156 @@
+[
+    {
+        "id": "q001",
+        "category": "dosing",
+        "question": "What is the recommended starting dose of amitriptyline for neuropathic pain?",
+        "ground_truth": "The recommended starting dose of amitriptyline for neuropathic pain is 10 to 25 mg orally at night, which may be gradually increased based on response and tolerability.",
+        "expected_source_keywords": ["amitriptyline", "dose", "neuropathic"]
+    },
+    {
+        "id": "q002",
+        "category": "dosing",
+        "question": "What is the standard oral dose of metformin for type 2 diabetes management?",
+        "ground_truth": "The standard starting dose of metformin is 500 mg orally twice daily or 850 mg once daily with meals, titrated up to a maximum of 2000 to 3000 mg per day.",
+        "expected_source_keywords": ["metformin", "dose", "diabetes"]
+    },
+    {
+        "id": "q003",
+        "category": "dosing",
+        "question": "What is the recommended dose of oral morphine for moderate to severe pain in adults?",
+        "ground_truth": "For moderate to severe pain in opioid-naive adults, the recommended starting dose of immediate-release oral morphine is 5 to 10 mg every 4 hours, titrated to effect.",
+        "expected_source_keywords": ["morphine", "dose", "pain"]
+    },
+    {
+        "id": "q004",
+        "category": "dosing",
+        "question": "What is the low-dose aspirin regimen recommended for antiplatelet therapy?",
+        "ground_truth": "The recommended low-dose aspirin regimen for antiplatelet therapy is 75 to 150 mg orally once daily.",
+        "expected_source_keywords": ["aspirin", "antiplatelet", "dose"]
+    },
+    {
+        "id": "q005",
+        "category": "dosing",
+        "question": "What is the recommended starting insulin dose for a patient newly initiated on insulin therapy?",
+        "ground_truth": "For patients newly initiated on basal insulin, a typical starting dose is 10 units or 0.1 to 0.2 units per kilogram of body weight once daily at bedtime, adjusted based on fasting glucose.",
+        "expected_source_keywords": ["insulin", "dose", "diabetes"]
+    },
+    {
+        "id": "q006",
+        "category": "contraindications",
+        "question": "What are the main contraindications for beta-blocker use?",
+        "ground_truth": "Beta-blockers are contraindicated in patients with acute decompensated heart failure, significant bradycardia, high-degree atrioventricular block without a pacemaker, and reactive airway disease such as asthma.",
+        "expected_source_keywords": ["beta-blocker", "contraindication", "asthma"]
+    },
+    {
+        "id": "q007",
+        "category": "contraindications",
+        "question": "When are NSAIDs contraindicated?",
+        "ground_truth": "NSAIDs are contraindicated in patients with active peptic ulcer disease, severe renal impairment, severe hepatic impairment, and should be avoided in the third trimester of pregnancy.",
+        "expected_source_keywords": ["NSAID", "contraindication", "peptic ulcer"]
+    },
+    {
+        "id": "q008",
+        "category": "contraindications",
+        "question": "What conditions contraindicate warfarin therapy?",
+        "ground_truth": "Warfarin is contraindicated in patients with active bleeding, high bleeding risk conditions, severe hepatic impairment, and during pregnancy due to teratogenicity.",
+        "expected_source_keywords": ["warfarin", "contraindication", "bleeding"]
+    },
+    {
+        "id": "q009",
+        "category": "contraindications",
+        "question": "What are the contraindications for lithium therapy?",
+        "ground_truth": "Lithium is contraindicated in patients with severe renal impairment, pregnancy, Addison disease, dehydration, and in the acute phase of myocardial infarction.",
+        "expected_source_keywords": ["lithium", "contraindication", "renal"]
+    },
+    {
+        "id": "q010",
+        "category": "indications",
+        "question": "What are the approved indications for metformin?",
+        "ground_truth": "Metformin is indicated for the management of type 2 diabetes mellitus, particularly in overweight or obese patients, as first-line pharmacotherapy when diet and exercise alone are insufficient.",
+        "expected_source_keywords": ["metformin", "indication", "type 2 diabetes"]
+    },
+    {
+        "id": "q011",
+        "category": "indications",
+        "question": "For what conditions is oral morphine listed as an essential medicine in palliative care?",
+        "ground_truth": "Oral morphine is listed as an essential medicine for the relief of moderate to severe pain in palliative care, including cancer pain and pain associated with other life-limiting conditions.",
+        "expected_source_keywords": ["morphine", "palliative", "pain"]
+    },
+    {
+        "id": "q012",
+        "category": "indications",
+        "question": "What are the clinical indications for amitriptyline?",
+        "ground_truth": "Amitriptyline is indicated for the treatment of depressive illness, neuropathic pain, migraine prophylaxis, and nocturnal enuresis in children.",
+        "expected_source_keywords": ["amitriptyline", "indication", "depression"]
+    },
+    {
+        "id": "q013",
+        "category": "indications",
+        "question": "What are the cardiovascular indications for low-dose aspirin?",
+        "ground_truth": "Low-dose aspirin is indicated for secondary prevention of cardiovascular events including myocardial infarction and stroke, and for antiplatelet therapy following coronary artery stenting.",
+        "expected_source_keywords": ["aspirin", "cardiovascular", "prevention"]
+    },
+    {
+        "id": "q014",
+        "category": "mechanism",
+        "question": "How does metformin lower blood glucose levels?",
+        "ground_truth": "Metformin lowers blood glucose primarily by inhibiting hepatic gluconeogenesis, reducing glucose absorption from the gastrointestinal tract, and improving peripheral insulin sensitivity without increasing insulin secretion.",
+        "expected_source_keywords": ["metformin", "mechanism", "gluconeogenesis"]
+    },
+    {
+        "id": "q015",
+        "category": "mechanism",
+        "question": "What is the mechanism of action of warfarin as an anticoagulant?",
+        "ground_truth": "Warfarin inhibits vitamin K epoxide reductase, preventing the recycling of vitamin K and thereby reducing the hepatic synthesis of clotting factors II, VII, IX, and X, as well as proteins C and S.",
+        "expected_source_keywords": ["warfarin", "mechanism", "vitamin K"]
+    },
+    {
+        "id": "q016",
+        "category": "mechanism",
+        "question": "How do beta-blockers exert their antihypertensive and antianginal effects?",
+        "ground_truth": "Beta-blockers competitively block catecholamines at beta-adrenergic receptors, reducing heart rate, myocardial contractility, and cardiac output, which lowers blood pressure and myocardial oxygen demand.",
+        "expected_source_keywords": ["beta-blocker", "mechanism", "heart rate"]
+    },
+    {
+        "id": "q017",
+        "category": "monitoring",
+        "question": "What INR range is targeted for patients on warfarin therapy for atrial fibrillation?",
+        "ground_truth": "For atrial fibrillation, the target INR range for warfarin therapy is 2.0 to 3.0, with monitoring frequency adjusted based on stability.",
+        "expected_source_keywords": ["warfarin", "INR", "monitoring"]
+    },
+    {
+        "id": "q018",
+        "category": "monitoring",
+        "question": "What serum lithium level is considered therapeutic, and how frequently should it be monitored?",
+        "ground_truth": "The therapeutic serum lithium level is 0.6 to 1.0 mmol/L for maintenance therapy. Levels should be checked every 3 to 6 months once stable, or more frequently after dose changes or when toxicity is suspected.",
+        "expected_source_keywords": ["lithium", "serum level", "monitoring"]
+    },
+    {
+        "id": "q019",
+        "category": "interactions",
+        "question": "What is the clinical significance of the interaction between warfarin and NSAIDs?",
+        "ground_truth": "Concurrent use of NSAIDs with warfarin increases the risk of bleeding through two mechanisms: pharmacodynamic inhibition of platelet aggregation and pharmacokinetic displacement of warfarin from plasma protein binding, raising INR.",
+        "expected_source_keywords": ["warfarin", "NSAID", "interaction", "bleeding"]
+    },
+    {
+        "id": "q020",
+        "category": "interactions",
+        "question": "What are the risks of combining metformin with iodinated contrast media?",
+        "ground_truth": "Metformin should be withheld 48 hours before and after administration of iodinated contrast media due to the risk of contrast-induced nephropathy leading to metformin accumulation and lactic acidosis.",
+        "expected_source_keywords": ["metformin", "contrast", "lactic acidosis"]
+    },
+    {
+        "id": "q021",
+        "category": "dosing",
+        "question": "What is the recommended daily dose of fluoxetine for major depressive disorder in adults?",
+        "ground_truth": "The recommended starting dose of fluoxetine for major depressive disorder in adults is 20 mg orally once daily in the morning, which may be increased to a maximum of 60 mg per day after several weeks.",
+        "expected_source_keywords": ["fluoxetine", "dose", "depression"]
+    },
+    {
+        "id": "q022",
+        "category": "contraindications",
+        "question": "Why are ACE inhibitors contraindicated in pregnancy?",
+        "ground_truth": "ACE inhibitors are contraindicated in pregnancy, particularly in the second and third trimesters, due to the risk of fetal renal dysgenesis, oligohydramnios, neonatal renal failure, and intrauterine growth restriction.",
+        "expected_source_keywords": ["ACE inhibitor", "pregnancy", "contraindication"]
+    }
+]
