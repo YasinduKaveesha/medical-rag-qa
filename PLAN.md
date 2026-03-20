@@ -1377,3 +1377,232 @@ Total: **~16 tests**.
 pytest tests/test_frameworks.py -v
 ruff check src/frameworks/ tests/test_frameworks.py
 ```
+
+---
+
+## Module 11 — Infrastructure: Docker, CI/CD, Gradio
+
+### Files to create / modify
+
+| File | Purpose |
+|------|---------|
+| `Dockerfile` | Containerise the FastAPI app on Python 3.11-slim |
+| `docker-compose.yml` | Orchestrate Qdrant + FastAPI on a shared network |
+| `.github/workflows/ci.yml` | GitHub Actions: lint + mocked test suite on every push to `main` |
+| `app/gradio_demo.py` | Standalone Gradio UI for HuggingFace Spaces |
+
+No new test file — Docker and CI correctness is verified by running them.
+`app/gradio_demo.py` is exercised manually/on HF Spaces; writing pytest tests for a Gradio UI block brings negligible value relative to cost.
+
+---
+
+### Dockerfile design
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install build tools needed by some wheels (e.g. sentence-transformers)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml .
+RUN pip install --no-cache-dir -e .
+
+COPY src/ src/
+COPY app/ app/
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+Key decisions:
+- **`python:3.11-slim`** — matches project requirement; slim avoids unnecessary OS packages.
+- **`pip install -e .`** — installs from `pyproject.toml`; editable install makes `src.*` importable without `PYTHONPATH` hacks.
+- **Copy `pyproject.toml` first** — Docker layer-caches the dependency install so code-only changes don't trigger a full `pip install`.
+- **`--host 0.0.0.0`** — required inside Docker (default `127.0.0.1` is unreachable from the host).
+- **No `.env` baked in** — secrets are injected at runtime via `docker run -e` or `docker-compose` `environment:` block.
+- Dev extras (`ruff`, `pytest`) are **not** installed — keeps the image lean.
+
+---
+
+### docker-compose.yml design
+
+Two services on a user-defined bridge network `rag-net`:
+
+| Service | Image | Ports | Role |
+|---------|-------|-------|------|
+| `qdrant` | `qdrant/qdrant:v1.9.2` | `6333:6333` | Vector store |
+| `fastapi` | built from `./Dockerfile` | `8000:8000` | API server |
+
+```yaml
+version: "3.9"
+
+networks:
+  rag-net:
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.9.2
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - rag-net
+
+  fastapi:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - QDRANT_HOST=qdrant          # service name resolves on rag-net
+      - QDRANT_PORT=6333
+      - COLLECTION_NAME=${COLLECTION_NAME:-medical_docs}
+      - LLM_MODEL=${LLM_MODEL:-llama-3.3-70b-versatile}
+    depends_on:
+      - qdrant
+    networks:
+      - rag-net
+
+volumes:
+  qdrant_data:
+```
+
+Key decisions:
+- **Named volume `qdrant_data`** — Qdrant data survives `docker-compose down` (without `--volumes`).
+- **`QDRANT_HOST=qdrant`** — Docker DNS resolves service names on a user-defined network; `localhost` would not work here.
+- **`depends_on`** — ensures Qdrant starts before FastAPI (start order only; no health-check polling).
+- **`${GROQ_API_KEY}` from host env** — keeps secrets out of the compose file; user runs `export GROQ_API_KEY=...` or uses a `.env` file that compose auto-loads.
+- **Pinned Qdrant image tag** — reproducible; avoids surprise breaking changes from `:latest`.
+
+---
+
+### .github/workflows/ci.yml design
+
+Trigger: `push` to `main` and `pull_request` targeting `main`.
+
+Steps:
+1. `actions/checkout@v4`
+2. `actions/setup-python@v5` with Python `3.11`
+3. `pip install -e ".[dev]"` — installs runtime + dev extras
+4. `ruff check src/ app/ tests/` — lint; fail fast on any error
+5. `pytest tests/ -v --tb=short` — full mocked test suite (no Qdrant, no Groq)
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src/ app/ tests/
+
+      - name: Test
+        run: pytest tests/ -v --tb=short
+        env:
+          GROQ_API_KEY: gsk-ci-placeholder   # satisfies Settings validation; no real calls made
+```
+
+Key decisions:
+- **`GROQ_API_KEY: gsk-ci-placeholder`** — all tests monkeypatch this env var anyway via `reset_settings` fixture; the env var is only needed so `get_settings()` doesn't raise at import time in modules that call it at module scope.
+- **No Qdrant service** — all tests use mocks/dependency overrides; no real vector store is required.
+- **`--tb=short`** — concise tracebacks in CI output without the full local-debugging verbosity.
+- **No caching** — kept simple for now; can add `actions/cache` for pip wheels in Module 12 if build times matter.
+
+---
+
+### app/gradio_demo.py design
+
+A self-contained Gradio app that calls the FastAPI `/ask` endpoint over HTTP, suitable for HuggingFace Spaces deployment (Spaces injects `FASTAPI_URL` or uses localhost if co-located).
+
+Public interface:
+```python
+def ask_question(question: str) -> tuple[str, str]:
+    """Send *question* to the /ask endpoint; return (answer, formatted sources)."""
+```
+
+UI layout:
+- **Textbox** — question input, placeholder text, submit on Enter
+- **Textbox** — answer output (read-only)
+- **Textbox** — sources output (read-only, multi-line, formatted as numbered list)
+- **Button** — "Ask" to trigger, "Clear" to reset
+- **Title + description** — "Medical RAG Q&A" with brief context note
+
+Configuration:
+- `FASTAPI_URL` environment variable (default `http://localhost:8000`) — allows Spaces to point at a deployed API without code changes.
+- `REQUEST_TIMEOUT` environment variable (default `30` seconds).
+- Graceful error display — if the endpoint is unreachable, display the error message in the answer box rather than raising.
+
+Sources formatted as:
+```
+[1] WHO-EML-2023.pdf  p.3
+    Amitriptyline 10–25 mg at night...
+```
+
+Key decisions:
+- **Calls FastAPI over HTTP** (not importing `src.*` directly) — the Gradio app and FastAPI server can run in separate processes/containers; keeps Spaces deployment simple (just needs the API URL).
+- **`gradio.Blocks`** — more layout control than `Interface`; allows side-by-side answer + sources.
+- **`share=False`** — HF Spaces handles public exposure; no need for Gradio's tunnel.
+- **No authentication** — demo-grade; add if needed.
+
+---
+
+### README additions
+
+Three-command quickstart (under 5 commands):
+
+```bash
+# 1. Copy env template and fill in your key
+cp .env.example .env && echo "GROQ_API_KEY=gsk-..." >> .env
+
+# 2. Build and start all services
+docker compose up --build -d
+
+# 3. Test the endpoint
+curl -s -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is the dose of amitriptyline for neuropathic pain?"}' | python -m json.tool
+```
+
+Health check (optional 4th command):
+```bash
+curl http://localhost:8000/health
+```
+
+---
+
+### Verification
+
+```bash
+# Docker build (no compose)
+docker build -t medical-rag-qa .
+
+# Compose up (requires running Docker)
+docker compose up --build
+
+# CI — runs automatically on push to main; verify locally with:
+ruff check src/ app/ tests/
+pytest tests/ -v
+```
