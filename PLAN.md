@@ -1000,3 +1000,380 @@ ruff check src/evaluation/ tests/test_evaluation.py
 # python -m src.evaluation.ragas_eval
 # python -m src.evaluation.chunking_comparison
 ```
+
+---
+
+---
+
+## Module 10 — Framework Comparison (LangChain vs LlamaIndex)
+
+### Files to create
+
+| File | Why |
+|------|-----|
+| `src/frameworks/langchain_pipeline.py` | Full RAG pipeline using LangChain LCEL |
+| `src/frameworks/llamaindex_pipeline.py` | Full RAG pipeline using LlamaIndex with a Qdrant bridge |
+| `tests/test_frameworks.py` | Mocked tests for both pipelines — no real Qdrant or Groq calls |
+
+---
+
+### Installed package versions (discovered by inspection)
+
+| Package | Version | Notes |
+|---|---|---|
+| `langchain` | 1.2.13 | |
+| `langchain_openai` | 1.1.11 | `ChatOpenAI` → Groq |
+| `langchain_community` | 0.4.1 | `Qdrant`, `HuggingFaceEmbeddings` |
+| `llama-index-core` | 0.14.18 | |
+| `llama-index-llms-openai` | 0.7.2 | supports `api_base` → Groq |
+| `llama-index-embeddings-openai` | 0.6.0 | |
+| `llama-index-vector-stores-qdrant` | **NOT INSTALLED** | Bridge needed |
+
+**Critical asymmetry:** LangChain can connect to Qdrant directly via
+`langchain_community.vectorstores.Qdrant`.  LlamaIndex has no Qdrant
+integration installed.  Both pipelines are made comparable by having
+LlamaIndex use a thin `BaseRetriever` subclass that delegates to our
+existing `QdrantStore` + `EmbeddingEncoder`.
+
+---
+
+### Shared output format
+
+Both `LangChainPipeline.query()` and `LlamaIndexPipeline.query()` return
+the same dict shape so comparison code can treat them identically:
+
+```python
+{
+    "answer":      str,        # LLM-generated answer
+    "sources":     list[dict], # retrieved chunks with metadata
+    "latency_ms":  float,      # wall-clock time for full query in milliseconds
+}
+```
+
+Each source dict:
+```python
+{
+    "chunk_text":       str,
+    "source_document":  str,
+    "page_number":      int | None,
+    "score":            float,
+}
+```
+
+---
+
+### `src/frameworks/langchain_pipeline.py`
+
+#### Class design
+
+```python
+class LangChainPipeline:
+    def __init__(
+        self,
+        _vectorstore: VectorStore | None = None,
+        _llm: BaseChatModel | None = None,
+    ) -> None: ...
+
+    def query(self, question: str, top_k: int = 5) -> dict: ...
+```
+
+#### Construction (when no injected mocks)
+
+```python
+s = get_settings()
+
+# 1. Embeddings (same model as our pipeline for fair comparison)
+embeddings = HuggingFaceEmbeddings(model_name=s.embedding_model)
+
+# 2. Qdrant vectorstore — connects to existing collection
+vectorstore = Qdrant.from_existing_collection(
+    embedding=embeddings,
+    host=s.qdrant_host,
+    port=s.qdrant_port,
+    collection_name=s.collection_name,
+)
+
+# 3. LLM — ChatOpenAI pointed at Groq
+llm = ChatOpenAI(
+    base_url=s.llm_base_url,
+    api_key=s.groq_api_key,
+    model=s.llm_model,
+    temperature=0,
+)
+```
+
+#### LCEL chain (`query()`)
+
+```python
+retriever = self._vectorstore.as_retriever(search_kwargs={"k": top_k})
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "Answer the question using ONLY the context below..."),
+    ("human", "Context:\n{context}\n\nQuestion: {question}"),
+])
+
+chain = (
+    {"context": retriever | _format_docs, "question": RunnablePassthrough()}
+    | prompt
+    | self._llm
+    | StrOutputParser()
+)
+
+t0 = time.perf_counter()
+answer = chain.invoke(question)
+latency_ms = (time.perf_counter() - t0) * 1000
+```
+
+`_format_docs` joins `Document.page_content` strings with `"\n\n"`.
+
+Sources are obtained via a separate `retriever.invoke(question)` call (or
+the chain is split at the retriever step to capture intermediate results).
+
+---
+
+### `src/frameworks/llamaindex_pipeline.py`
+
+#### The Qdrant bridge — `_QdrantBridgeRetriever`
+
+Since `llama-index-vector-stores-qdrant` is not installed, a thin
+`BaseRetriever` subclass wraps our existing `QdrantStore` +
+`EmbeddingEncoder`:
+
+```python
+class _QdrantBridgeRetriever(BaseRetriever):
+    """LlamaIndex-compatible retriever backed by our QdrantStore."""
+
+    def __init__(
+        self,
+        store: QdrantStore,
+        encoder: EmbeddingEncoder,
+        top_k: int = 5,
+    ) -> None: ...
+
+    def _retrieve(self, query_bundle: QueryBundle) -> list[NodeWithScore]:
+        query_vector = self._encoder.encode(query_bundle.query_str)
+        candidates = self._store.search(query_vector, top_k=self._top_k)
+        nodes = []
+        for c in candidates:
+            chunk = c["chunk"]
+            node = TextNode(
+                text=chunk.get("text", ""),
+                metadata={k: v for k, v in chunk.items() if k != "text"},
+            )
+            nodes.append(NodeWithScore(node=node, score=c["score"]))
+        return nodes
+```
+
+This retriever produces `NodeWithScore` objects in the standard LlamaIndex
+interface — everything downstream (synthesis, citation extraction) uses
+pure LlamaIndex APIs.
+
+#### Class design
+
+```python
+class LlamaIndexPipeline:
+    def __init__(
+        self,
+        encoder: EmbeddingEncoder | None = None,
+        store: QdrantStore | None = None,
+        _query_engine: RetrieverQueryEngine | None = None,
+    ) -> None: ...
+
+    def query(self, question: str, top_k: int = 5) -> dict: ...
+```
+
+#### Construction (when no injected mock)
+
+```python
+s = get_settings()
+
+# LLM — LlamaIndex OpenAI pointed at Groq
+llm = LlamaOpenAI(
+    model=s.llm_model,
+    api_key=s.groq_api_key,
+    api_base=s.llm_base_url,
+    temperature=0,
+)
+
+# Bridge retriever (wraps our QdrantStore + EmbeddingEncoder)
+retriever = _QdrantBridgeRetriever(
+    store=store or get_store(),
+    encoder=encoder or get_encoder(),
+    top_k=5,
+)
+
+# Query engine — uses LlamaIndex's synthesis pipeline
+query_engine = RetrieverQueryEngine.from_args(
+    retriever=retriever,
+    llm=llm,
+)
+```
+
+#### `query()` implementation
+
+```python
+def query(self, question: str, top_k: int = 5) -> dict:
+    t0 = time.perf_counter()
+    response = self._query_engine.query(question)
+    latency_ms = (time.perf_counter() - t0) * 1000
+
+    answer = str(response)
+    sources = [
+        {
+            "chunk_text": ns.node.get_content(),
+            "source_document": ns.node.metadata.get("source_document", ""),
+            "page_number": ns.node.metadata.get("page_number"),
+            "score": ns.score or 0.0,
+        }
+        for ns in (response.source_nodes or [])
+    ]
+    return {"answer": answer, "sources": sources, "latency_ms": latency_ms}
+```
+
+---
+
+### Comparison metrics
+
+Both pipelines expose the same `query() -> dict` interface, so comparison
+is straightforward:
+
+| Metric | How measured |
+|---|---|
+| **Latency** | `latency_ms` in each pipeline's output dict (wall-clock, includes retrieval + generation) |
+| **Faithfulness** | RAGAS `Faithfulness` score via `src.evaluation.ragas_eval.run_ragas` |
+| **Answer relevancy** | RAGAS `AnswerRelevancy` score via `src.evaluation.ragas_eval.run_ragas` |
+
+A manual comparison run (not part of the test suite) calls both pipelines
+on the test queries from `test_queries.json`, feeds results to `run_ragas`,
+and saves a side-by-side CSV and chart using `save_comparison` from
+`chunking_comparison.py` (reusing the same save logic with
+`strategy="langchain"` / `strategy="llamaindex"`).
+
+---
+
+### Testing strategy — `tests/test_frameworks.py`
+
+**No real services.** All Qdrant, LLM, and embedding calls are replaced
+with `MagicMock` or lightweight fakes injected via constructor parameters.
+
+#### LangChain pipeline fixtures
+
+```python
+@pytest.fixture
+def mock_vectorstore():
+    doc = Document(
+        page_content="Amitriptyline 10–25 mg at night.",
+        metadata={"source_document": "WHO.pdf", "page_number": 3},
+    )
+    m = MagicMock()
+    m.as_retriever.return_value.invoke.return_value = [doc]
+    return m
+
+@pytest.fixture
+def mock_chat_llm():
+    m = MagicMock()
+    # Make it behave like a Runnable returning an AIMessage-like object
+    m.invoke.return_value = AIMessage(content="The dose is 25 mg.")
+    return m
+
+@pytest.fixture
+def langchain_pipeline(mock_vectorstore, mock_chat_llm, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+    import src.config as cfg; cfg._settings = None
+    return LangChainPipeline(_vectorstore=mock_vectorstore, _llm=mock_chat_llm)
+```
+
+#### LlamaIndex pipeline fixtures
+
+```python
+@pytest.fixture
+def mock_query_engine():
+    from llama_index.core.base.response.schema import Response
+    from llama_index.core.schema import NodeWithScore, TextNode
+    node = NodeWithScore(
+        node=TextNode(text="Chunk text.", metadata={"source_document": "WHO.pdf"}),
+        score=0.85,
+    )
+    mock_response = Response(response="The dose is 25 mg.", source_nodes=[node])
+    m = MagicMock()
+    m.query.return_value = mock_response
+    return m
+
+@pytest.fixture
+def llamaindex_pipeline(mock_query_engine, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+    import src.config as cfg; cfg._settings = None
+    return LlamaIndexPipeline(_query_engine=mock_query_engine)
+```
+
+#### Tests planned
+
+**LangChain pipeline**
+
+| Test | What it checks |
+|------|----------------|
+| `test_langchain_query_returns_dict` | Return value is a `dict` |
+| `test_langchain_query_has_answer` | `"answer"` key is a non-empty string |
+| `test_langchain_query_has_sources` | `"sources"` key is a list |
+| `test_langchain_query_has_latency` | `"latency_ms"` key is a float ≥ 0 |
+| `test_langchain_sources_have_required_fields` | Each source has `chunk_text`, `source_document`, `score` |
+| `test_langchain_calls_retriever` | `vectorstore.as_retriever()` is called |
+| `test_langchain_passes_question` | Question text appears in the invocation path |
+
+**LlamaIndex pipeline**
+
+| Test | What it checks |
+|------|----------------|
+| `test_llamaindex_query_returns_dict` | Return value is a `dict` |
+| `test_llamaindex_query_has_answer` | `"answer"` key is a non-empty string |
+| `test_llamaindex_query_has_sources` | `"sources"` key is a list |
+| `test_llamaindex_query_has_latency` | `"latency_ms"` key is a float ≥ 0 |
+| `test_llamaindex_sources_from_response_nodes` | Sources are extracted from `response.source_nodes` |
+| `test_llamaindex_calls_query_engine` | `query_engine.query()` is called with the question |
+
+**Shared / comparison**
+
+| Test | What it checks |
+|------|----------------|
+| `test_output_formats_match` | Both pipelines return the same top-level keys |
+| `test_latency_is_positive` | `latency_ms > 0` for both pipelines |
+
+Total: **~16 tests**.
+
+---
+
+### Architecture decisions
+
+1. **LlamaIndex `_QdrantBridgeRetriever`** — since
+   `llama-index-vector-stores-qdrant` is not installed, subclassing
+   `BaseRetriever` is the standard extension point.  It keeps LlamaIndex's
+   synthesis pipeline (prompt assembly, citation tracking via `source_nodes`)
+   intact while sourcing vectors from our existing `QdrantStore`.
+
+2. **`_query_engine` injection for LlamaIndex** — injecting the entire
+   `RetrieverQueryEngine` (rather than just the LLM) is the cleanest seam
+   for testing: one mock replaces the entire LlamaIndex stack without needing
+   to understand `ServiceContext` or `Settings` global state.
+
+3. **`_vectorstore` + `_llm` injection for LangChain** — the LCEL chain
+   is built inside `query()` from these two injected objects, so tests control
+   both retrieval and generation independently.
+
+4. **Same system prompt text** — both pipelines use the same instruction
+   text ("Answer using ONLY the context below…") so prompt wording does not
+   confound the comparison.
+
+5. **`temperature=0` for both** — consistent with `LLMClient` in Module 7
+   and required for reproducible RAGAS scores.
+
+6. **Latency includes retrieval + generation** — the timer wraps the entire
+   `query()` call so both pipelines are measured end-to-end consistently.
+
+---
+
+### Verification
+
+```bash
+pytest tests/test_frameworks.py -v
+ruff check src/frameworks/ tests/test_frameworks.py
+```
