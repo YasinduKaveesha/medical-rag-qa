@@ -9,7 +9,7 @@
 ![LangChain](https://img.shields.io/badge/LangChain-1.2-lightgreen?logo=chainlink)
 ![HuggingFace](https://img.shields.io/badge/HuggingFace-all--MiniLM--L6--v2-yellow?logo=huggingface)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker)
-![CI](https://img.shields.io/github/actions/workflow/status/your-username/medical-rag-qa/ci.yml?label=CI&logo=githubactions)
+![CI](https://img.shields.io/github/actions/workflow/status/YasinduKaveesha/medical-rag-qa/ci.yml?label=CI&logo=githubactions)
 
 ---
 
@@ -138,7 +138,7 @@ flowchart LR
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/your-username/medical-rag-qa.git
+git clone https://github.com/YasinduKaveesha/medical-rag-qa.git
 cd medical-rag-qa
 pip install -e ".[dev]"
 
