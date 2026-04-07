@@ -419,6 +419,249 @@ pytest tests/ --tb=short
 
 ---
 
+---
+
+## Phase 2: Multimodal Extension
+
+### What's New
+
+- **CLIP embeddings** — `openai/clip-vit-base-patch32` (512-dim) for joint image–text retrieval
+- **BLIP image captioning** — `Salesforce/blip-image-captioning-base` generates natural-language descriptions of embedded PDF images
+- **Dual-collection architecture** — `text_chunks` (MiniLM 384-dim) + `multimodal_clip` (CLIP 512-dim) running in parallel Qdrant collections
+- **Reciprocal Rank Fusion** — merges text and image ranked lists with deduplication by `image_id` (same image retrieved via CLIP and caption-text gets one merged result)
+- **`POST /ask-multimodal`** — new endpoint with optional vision model (`llama-3.2-11b-vision-preview` via Groq), image gallery in Gradio demo
+- **Custom keyword-based evaluation** — deterministic, free, no external LLM judge; 15 test queries (8 image, 7 text) with expected keyword sets
+
+### Multimodal Results (placeholder)
+
+> Run `python -m src.evaluation.multimodal_eval` after ingesting image-rich PDFs to populate these figures.
+
+| Metric | Text-Only (Phase 1) | Multimodal (Phase 2) |
+|---|---|---|
+| Text retrieval precision@5 | 0.XX | 0.XX |
+| Image retrieval precision@5 | N/A | 0.XX |
+| Modality accuracy | N/A | 0.XX |
+| Avg retrieval latency | XXms | XXms |
+
+### Multimodal Architecture
+
+```
+PDF ──► parse_pdf() ──► attach_metadata() ──► SentenceChunker.chunk()
+         │                                          │
+         │                                          ▼
+         │                              EmbeddingEncoder (MiniLM 384-dim)
+         │                                          │
+         │                                          ▼
+         │                              QdrantStore — text_chunks collection
+         │
+         └──► ImageExtractor.extract_images_from_pdf()
+                    │
+                    ▼
+              ImageCaptioner.caption_extracted_images()  [BLIP]
+                    │
+          ┌─────────┴──────────────────────────────────────┐
+          │                                                 │
+          ▼                                                 ▼
+   CLIPEncoder.encode_image()               EmbeddingEncoder.encode_batch(captions)
+          │                                                 │
+          ▼                                                 ▼
+   MultiModalVectorStore                    MultiModalVectorStore
+   multimodal_clip collection               text_chunks collection
+   (type="image", 512-dim)                 (type="image_caption" + image_id, 384-dim)
+
+
+Query ──► MultiModalRetrievalPipeline.retrieve()
+               │
+     ┌─────────┴──────────────────────────────┐
+     │                                         │
+     ▼                                         ▼
+EmbeddingEncoder.encode()            CLIPEncoder.encode_text()
+     │                                         │
+     ▼                                         ▼
+QdrantStore.search()                 MultiModalVectorStore.search_clip()
+     │                                         │
+     ▼                                         │
+CrossEncoderReranker.rerank()                  │
+     │                                         │
+     └─────────────┬───────────────────────────┘
+                   ▼
+       reciprocal_rank_fusion()
+       [deduplicate by image_id — keep highest RRF score, merge metadata]
+                   │
+         ┌─────────┴──────────┐
+         ▼                    ▼
+    text_chunks            images
+         │                    │
+         └────────┬───────────┘
+                  ▼
+    build_multimodal_prompt()
+                  │
+         use_vision? ──yes──► LLMClient.generate_with_vision()  [Groq vision]
+                  │
+                  no
+                  │
+                  ▼
+         LLMClient.generate()
+                  │
+                  ▼
+    extract_multimodal_citations()
+                  │
+                  ▼
+         POST /ask-multimodal  →  { answer, text_sources, image_sources,
+                                    used_vision_model, retrieval_time_ms }
+```
+
+### New API: `POST /ask-multimodal`
+
+```bash
+curl -s -X POST http://localhost:8000/ask-multimodal \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What does a chest X-ray showing pneumonia look like?",
+    "use_vision": false,
+    "top_k": 5,
+    "include_images": true
+  }' | python -m json.tool
+```
+
+**Response `200 OK`**
+
+```json
+{
+  "answer": "Chest X-rays in pneumonia typically show unilateral or bilateral consolidation with air bronchograms. [Source: radiology_atlas.pdf, Page 3]",
+  "text_sources": [
+    {
+      "claim": "Chest X-rays in pneumonia typically show unilateral or bilateral consolidation...",
+      "source_type": "text",
+      "source_document": "who_guidelines.pdf",
+      "page_number": 5,
+      "chunk_text": "Lobar consolidation is the hallmark radiographic finding in pneumococcal pneumonia.",
+      "image_path": null,
+      "image_caption": null
+    }
+  ],
+  "image_sources": [
+    {
+      "image_id": "radiology_atlas_p3_x1",
+      "image_path": "data/extracted_images/radiology_atlas_p3_x1.png",
+      "caption": "chest X-ray showing bilateral consolidation consistent with pneumonia",
+      "source_pdf": "radiology_atlas.pdf",
+      "page_number": 3,
+      "relevance_score": 0.0164
+    }
+  ],
+  "used_vision_model": false,
+  "retrieval_time_ms": 142.3,
+  "model_version": "llama-3.3-70b-versatile"
+}
+```
+
+Serve an extracted image directly:
+
+```bash
+curl http://localhost:8000/images/radiology_atlas_p3_x1 --output image.png
+```
+
+### Ingest Multimodal Documents
+
+```bash
+# Extract images, caption with BLIP, embed with CLIP + MiniLM, upsert to Qdrant
+python scripts/ingest_multimodal.py --pdf-dir data/raw/ --output-dir data/extracted_images/
+
+# GPU acceleration (if available)
+python scripts/ingest_multimodal.py --pdf-dir data/raw/ --device cuda
+```
+
+### Updated Project Structure
+
+```
+medical-rag-qa/
+├── Dockerfile
+├── docker-compose.yml
+├── pyproject.toml
+├── .env.example
+├── .github/
+│   └── workflows/
+│       └── ci.yml                           # -k "not slow and not integration"
+│
+├── data/
+│   ├── raw/                                 # source PDFs (gitignored)
+│   └── extracted_images/                    # BLIP-captioned PNGs (gitignored)  ← NEW
+│
+├── scripts/
+│   └── ingest_multimodal.py                 # CLI ingest script  ← NEW
+│
+├── src/
+│   ├── config.py                            # + clip/caption/vision/rrf fields  ← EXTENDED
+│   ├── ingestion/
+│   │   ├── pdf_parser.py
+│   │   ├── chunkers.py
+│   │   ├── metadata.py
+│   │   ├── image_extractor.py               # PyMuPDF xref extraction  ← NEW
+│   │   └── image_captioner.py               # BLIP captioning  ← NEW
+│   ├── embeddings/
+│   │   ├── encoder.py
+│   │   └── clip_encoder.py                  # CLIP 512-dim encoder  ← NEW
+│   ├── retrieval/
+│   │   ├── vector_store.py                  # + MultiModalVectorStore  ← EXTENDED
+│   │   ├── reranker.py
+│   │   ├── pipeline.py
+│   │   ├── fusion.py                        # reciprocal_rank_fusion()  ← NEW
+│   │   └── multimodal_pipeline.py           # MultiModalRetrievalPipeline  ← NEW
+│   ├── generation/
+│   │   ├── prompt_builder.py                # + build_multimodal_prompt()  ← EXTENDED
+│   │   ├── llm_client.py                    # + generate_with_vision()  ← EXTENDED
+│   │   ├── refusal.py
+│   │   └── citations.py                     # + extract_multimodal_citations()  ← EXTENDED
+│   ├── evaluation/
+│   │   ├── test_queries.json
+│   │   ├── ragas_eval.py
+│   │   ├── chunking_comparison.py
+│   │   ├── multimodal_eval.py               # keyword-based MM evaluator  ← NEW
+│   │   └── multimodal_test_queries.json     # 15 queries (8 image, 7 text)  ← NEW
+│   └── frameworks/
+│       ├── langchain_pipeline.py
+│       └── llamaindex_pipeline.py
+│
+├── app/
+│   ├── main.py                              # + POST /ask-multimodal, GET /images/{id}  ← EXTENDED
+│   ├── schemas.py                           # + MultiModalAskRequest/Response  ← EXTENDED
+│   └── gradio_demo.py                       # + Multimodal Q&A tab  ← EXTENDED
+│
+└── tests/
+    ├── test_config.py                        #   5 → 8 tests
+    ├── test_ingestion.py                     #  24 tests
+    ├── test_embeddings.py                    #  19 tests
+    ├── test_chunking.py                      #  35 tests
+    ├── test_vector_store.py                  #  27 → 37 tests
+    ├── test_reranker.py                      #  20 tests
+    ├── test_retrieval_pipeline.py            #  22 tests
+    ├── test_generation.py                    #  34 tests
+    ├── test_api.py                           #  22 tests
+    ├── test_evaluation.py                    #  23 tests
+    ├── test_frameworks.py                    #  21 tests  ← 252 P1 total (unchanged)
+    ├── test_image_extractor.py               #  12 tests  ← NEW
+    ├── test_image_captioner.py               #  10 tests  ← NEW
+    ├── test_clip_encoder.py                  #  12 tests  ← NEW
+    ├── test_fusion.py                        #   9 tests  ← NEW
+    ├── test_multimodal_pipeline.py           #   8 tests  ← NEW
+    ├── test_multimodal_generation.py         #  12 tests  ← NEW
+    ├── test_multimodal_api.py                #   8 tests  ← NEW
+    ├── test_multimodal_eval.py               #   9 tests  ← NEW
+    └── test_gradio_multimodal.py             #   5 tests  ← NEW  (349 total)
+```
+
+### What's Next
+
+**Phase 3 — Agentic RAG with LangGraph**
+
+- RAG retriever exposed as a LangGraph tool
+- Multi-agent orchestration: retriever agent + citation agent + refusal agent
+- Conversation memory with per-session context window management
+- Streaming responses via Server-Sent Events
+
+---
+
 ## License
 
 [MIT](LICENSE)
