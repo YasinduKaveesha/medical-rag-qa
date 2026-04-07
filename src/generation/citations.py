@@ -96,3 +96,126 @@ def extract_citations(answer: str, chunks: list[dict]) -> list[dict]:
         len(citations),
     )
     return citations
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Multimodal citation extraction
+# ---------------------------------------------------------------------------
+
+# [Source: some_file.pdf, Page 5]
+_SOURCE_REF_RE = re.compile(
+    r"\[Source:\s*(?P<doc>[^,\]]+),\s*Page\s*(?P<page>\d+)\]", re.IGNORECASE
+)
+# [Image from: some_file.pdf, Page 12]
+_IMAGE_REF_RE = re.compile(
+    r"\[Image from:\s*(?P<doc>[^,\]]+),\s*Page\s*(?P<page>\d+)\]", re.IGNORECASE
+)
+
+
+def extract_multimodal_citations(
+    answer: str,
+    text_chunks: list[dict],
+    images: list[dict],
+) -> list[dict]:
+    """Map multimodal answer text back to source text chunks and images.
+
+    Scans *answer* for ``[Source: X, Page Y]`` and ``[Image from: X, Page Y]``
+    reference markers produced by :func:`src.generation.prompt_builder.build_multimodal_prompt`.
+    Each reference is matched to the corresponding chunk or image by document
+    name and page number.
+
+    Args:
+        answer: LLM-generated answer string.
+        text_chunks: Flat text chunk dicts (keys: ``text``/``chunk_text``,
+            ``source_document``, ``page_number``).
+        images: Flat image dicts (keys: ``caption``, ``source_pdf`` or
+            ``source_document``, ``page_number``, ``image_path``).
+
+    Returns:
+        List of citation dicts, each with:
+
+        - ``"claim"`` — sentence containing the reference.
+        - ``"source_type"`` — ``"text"`` or ``"image"``.
+        - ``"source_document"`` — document filename.
+        - ``"page_number"`` — integer page number.
+        - ``"chunk_text"`` — chunk body text (``None`` for image citations).
+        - ``"image_path"`` — path to image file (``None`` for text citations).
+        - ``"image_caption"`` — caption string (``None`` for text citations).
+
+        Returns ``[]`` when *answer* contains no recognised reference markers.
+    """
+    if not answer:
+        return []
+
+    sentences = [s.strip() for s in _SENTENCE_RE.split(answer) if s.strip()]
+    # Also treat the whole answer as one block in case it isn't sentence-split
+    if not sentences:
+        sentences = [answer.strip()]
+
+    citations: list[dict] = []
+
+    for sentence in sentences:
+        # Text source references
+        for m in _SOURCE_REF_RE.finditer(sentence):
+            doc = m.group("doc").strip()
+            page = int(m.group("page"))
+            matched = _match_text_chunk(doc, page, text_chunks)
+            citations.append(
+                {
+                    "claim": sentence,
+                    "source_type": "text",
+                    "source_document": doc,
+                    "page_number": page,
+                    "chunk_text": matched.get("text") or matched.get("chunk_text")
+                    if matched
+                    else None,
+                    "image_path": None,
+                    "image_caption": None,
+                }
+            )
+
+        # Image source references
+        for m in _IMAGE_REF_RE.finditer(sentence):
+            doc = m.group("doc").strip()
+            page = int(m.group("page"))
+            matched = _match_image(doc, page, images)
+            citations.append(
+                {
+                    "claim": sentence,
+                    "source_type": "image",
+                    "source_document": doc,
+                    "page_number": page,
+                    "chunk_text": None,
+                    "image_path": matched.get("image_path") if matched else None,
+                    "image_caption": matched.get("caption") if matched else None,
+                }
+            )
+
+    logger.debug(
+        "extract_multimodal_citations: %d sentences -> %d citations",
+        len(sentences),
+        len(citations),
+    )
+    return citations
+
+
+def _match_text_chunk(doc: str, page: int, chunks: list[dict]) -> dict | None:
+    """Return the first chunk whose source_document and page_number match."""
+    for chunk in chunks:
+        chunk_doc = chunk.get("source_document", "")
+        chunk_page = chunk.get("page_number")
+        if doc in chunk_doc or chunk_doc in doc:
+            if chunk_page == page:
+                return chunk
+    return None
+
+
+def _match_image(doc: str, page: int, images: list[dict]) -> dict | None:
+    """Return the first image whose source (source_pdf/source_document) and page match."""
+    for img in images:
+        img_doc = img.get("source_pdf", img.get("source_document", ""))
+        img_page = img.get("page_number")
+        if doc in img_doc or img_doc in doc:
+            if img_page == page:
+                return img
+    return None
