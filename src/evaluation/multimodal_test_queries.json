@@ -1,0 +1,92 @@
+[
+  {
+    "query_id": "img_001",
+    "question": "Show me the anatomical diagram of the human respiratory system",
+    "expected_type": "image",
+    "expected_keywords": ["lung", "bronchus", "trachea", "respiratory", "anatomy"]
+  },
+  {
+    "query_id": "img_002",
+    "question": "What does a chest X-ray showing pneumonia look like?",
+    "expected_type": "image",
+    "expected_keywords": ["infiltrate", "opacity", "consolidation", "bilateral", "chest"]
+  },
+  {
+    "query_id": "img_003",
+    "question": "Show the clinical decision flowchart for diabetes management",
+    "expected_type": "image",
+    "expected_keywords": ["flowchart", "diabetes", "glycemic", "insulin", "glucose"]
+  },
+  {
+    "query_id": "img_004",
+    "question": "Illustrate the pathophysiology of sepsis progression",
+    "expected_type": "image",
+    "expected_keywords": ["sepsis", "inflammation", "cytokine", "organ", "dysfunction"]
+  },
+  {
+    "query_id": "img_005",
+    "question": "What do retinal changes in diabetic retinopathy look like?",
+    "expected_type": "image",
+    "expected_keywords": ["retina", "microaneurysm", "hemorrhage", "diabetic", "fundus"]
+  },
+  {
+    "query_id": "img_006",
+    "question": "Show the treatment algorithm diagram for hypertension",
+    "expected_type": "image",
+    "expected_keywords": ["hypertension", "blood pressure", "algorithm", "treatment", "antihypertensive"]
+  },
+  {
+    "query_id": "img_007",
+    "question": "Display the anatomical cross-section of the heart chambers",
+    "expected_type": "image",
+    "expected_keywords": ["heart", "ventricle", "atrium", "cardiac", "chamber"]
+  },
+  {
+    "query_id": "img_008",
+    "question": "Show the dermatological images of skin lesion classification",
+    "expected_type": "image",
+    "expected_keywords": ["lesion", "skin", "rash", "melanoma", "dermatology"]
+  },
+  {
+    "query_id": "txt_001",
+    "question": "What is the recommended dosage of amoxicillin for adult pneumonia?",
+    "expected_type": "text",
+    "expected_keywords": ["amoxicillin", "dosage", "mg", "pneumonia", "antibiotic"]
+  },
+  {
+    "query_id": "txt_002",
+    "question": "What are the diagnostic criteria for type 2 diabetes mellitus?",
+    "expected_type": "text",
+    "expected_keywords": ["diabetes", "HbA1c", "glucose", "fasting", "diagnostic"]
+  },
+  {
+    "query_id": "txt_003",
+    "question": "List the first-line antibiotics for community-acquired pneumonia",
+    "expected_type": "text",
+    "expected_keywords": ["antibiotic", "pneumonia", "azithromycin", "doxycycline", "community-acquired"]
+  },
+  {
+    "query_id": "txt_004",
+    "question": "What are the WHO guidelines for tuberculosis treatment duration?",
+    "expected_type": "text",
+    "expected_keywords": ["tuberculosis", "WHO", "treatment", "months", "rifampicin"]
+  },
+  {
+    "query_id": "txt_005",
+    "question": "How should hypertension be managed in patients with chronic kidney disease?",
+    "expected_type": "text",
+    "expected_keywords": ["hypertension", "kidney", "ACE inhibitor", "blood pressure", "CKD"]
+  },
+  {
+    "query_id": "txt_006",
+    "question": "What are the contraindications for metformin use in diabetes?",
+    "expected_type": "text",
+    "expected_keywords": ["metformin", "contraindication", "renal", "eGFR", "diabetes"]
+  },
+  {
+    "query_id": "txt_007",
+    "question": "Describe the clinical management protocol for septic shock",
+    "expected_type": "text",
+    "expected_keywords": ["septic shock", "fluid", "vasopressor", "antibiotic", "resuscitation"]
+  }
+]

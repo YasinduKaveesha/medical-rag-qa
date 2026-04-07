@@ -20,6 +20,10 @@ Output files are written to ``reports/figures/``.
 
 from __future__ import annotations
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 import logging
 import os
 import time
