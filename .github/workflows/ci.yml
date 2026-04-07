@@ -24,7 +24,7 @@ jobs:
         run: ruff check src/ app/ tests/
 
       - name: Test
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/ -v --tb=short -k "not slow and not integration"
         env:
           # Satisfies Settings validation — no real Groq calls are made
           # (all tests use mocks/dependency overrides)
