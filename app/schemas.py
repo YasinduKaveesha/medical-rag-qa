@@ -74,6 +74,68 @@ class AskResponse(BaseModel):
     model_version: str
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 — Multimodal schemas
+# ---------------------------------------------------------------------------
+
+
+class MultiModalAskRequest(BaseModel):
+    """Request body for the POST /ask-multimodal endpoint.
+
+    Attributes:
+        question: Natural-language medical question from the user.
+        use_vision: When ``True`` and images are retrieved, call the vision LLM.
+        top_k: Total number of fused results to retrieve.
+        include_images: When ``False``, suppress image results from the response.
+    """
+
+    question: str
+    use_vision: bool = False
+    top_k: int = 5
+    include_images: bool = True
+
+
+class ImageResult(BaseModel):
+    """One image result returned by POST /ask-multimodal.
+
+    Attributes:
+        image_id:       Unique identifier (``{pdf_stem}_p{page}_x{xref}``).
+        image_path:     Relative path to the saved PNG file.
+        caption:        BLIP-generated natural-language description.
+        source_pdf:     Filename of the source PDF.
+        page_number:    1-based page number where the image was found.
+        relevance_score: RRF score from the fusion step.
+    """
+
+    image_id: str
+    image_path: str
+    caption: str
+    source_pdf: str
+    page_number: int
+    relevance_score: float
+
+
+class MultiModalAskResponse(BaseModel):
+    """Response body for the POST /ask-multimodal endpoint.
+
+    Attributes:
+        answer:             LLM-generated answer string.
+        text_sources:       Flat citation dicts from
+                            :func:`src.generation.citations.extract_multimodal_citations`.
+        image_sources:      Image results included in the answer context.
+        used_vision_model:  ``True`` when the vision LLM was used.
+        retrieval_time_ms:  Wall-clock retrieval latency in milliseconds.
+        model_version:      LLM model identifier used for generation.
+    """
+
+    answer: str
+    text_sources: list[dict]
+    image_sources: list[ImageResult]
+    used_vision_model: bool
+    retrieval_time_ms: float
+    model_version: str
+
+
 class HealthResponse(BaseModel):
     """Response body for the GET /health endpoint.
 
