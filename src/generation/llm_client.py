@@ -107,6 +107,67 @@ class LLMClient:
         logger.info("LLMClient.generate: response_chars=%d", len(answer))
         return answer
 
+    def generate_with_vision(
+        self,
+        prompt: str,
+        image_paths: list[str],
+        max_images: int = 2,
+    ) -> str:
+        """Send *prompt* plus base64-encoded images to a vision LLM.
+
+        Falls back to :meth:`generate` (text-only) on any exception so the
+        demo never fails due to missing vision support or bad image files.
+
+        Args:
+            prompt: Assembled prompt string.
+            image_paths: Paths to PNG image files to include.  Only the first
+                *max_images* paths are used.
+            max_images: Maximum number of images to attach.  Defaults to ``2``.
+
+        Returns:
+            Stripped response text from the vision LLM, or the text-only
+            fallback response if vision is unavailable.
+        """
+        try:
+            import base64  # noqa: PLC0415
+            from pathlib import Path  # noqa: PLC0415
+
+            vision_model = get_settings().vision_llm_model
+            selected_paths = image_paths[:max_images]
+
+            content: list[dict] = [{"type": "text", "text": prompt}]
+            for img_path in selected_paths:
+                img_bytes = Path(img_path).read_bytes()
+                b64 = base64.b64encode(img_bytes).decode("utf-8")
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    }
+                )
+
+            logger.info(
+                "LLMClient.generate_with_vision: model=%s  images=%d",
+                vision_model,
+                len(selected_paths),
+            )
+            response = self._client.chat.completions.create(
+                model=vision_model,
+                messages=[{"role": "user", "content": content}],
+                max_tokens=1024,
+            )
+            answer = response.choices[0].message.content.strip()
+            logger.info("LLMClient.generate_with_vision: response_chars=%d", len(answer))
+            return answer
+
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "generate_with_vision failed (%s: %s) — falling back to text-only generate()",
+                type(exc).__name__,
+                exc,
+            )
+            return self.generate(prompt)
+
 
 # ---------------------------------------------------------------------------
 # Singleton accessor
