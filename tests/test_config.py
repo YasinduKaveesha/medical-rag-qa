@@ -117,3 +117,42 @@ def test_setup_logging_runs_without_error():
 
     setup_logging()  # idempotent — calling twice is fine
     setup_logging()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Multimodal config tests
+# ---------------------------------------------------------------------------
+
+
+def test_config_has_clip_collection_name(monkeypatch):
+    """Settings includes clip_collection_name defaulting to 'multimodal_clip'."""
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test-key")
+    import src.config as cfg
+
+    cfg._settings = None
+    settings = cfg.get_settings()
+    assert settings.clip_collection_name == "multimodal_clip"
+    cfg._settings = None
+
+
+def test_config_has_caption_model(monkeypatch):
+    """Settings includes caption_model containing 'blip'."""
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test-key")
+    import src.config as cfg
+
+    cfg._settings = None
+    settings = cfg.get_settings()
+    assert "blip" in settings.caption_model.lower()
+    cfg._settings = None
+
+
+def test_config_has_device_field(monkeypatch):
+    """Settings includes device field as a string."""
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test-key")
+    import src.config as cfg
+
+    cfg._settings = None
+    settings = cfg.get_settings()
+    assert isinstance(settings.device, str)
+    assert settings.device in ("cpu", "cuda")
+    cfg._settings = None

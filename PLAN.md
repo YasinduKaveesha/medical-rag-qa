@@ -1606,3 +1606,663 @@ docker compose up --build
 ruff check src/ app/ tests/
 pytest tests/ -v
 ```
+
+---
+---
+
+# Phase 2: Multimodal RAG Extension
+
+## What I understood from CLAUDE.md
+
+Phase 2 extends the existing text-only RAG system (252 tests, all passing) with
+image understanding — **without breaking anything in Phase 1**.
+
+The core idea:
+- Extract images from clinical PDFs (diagrams, flowcharts, X-rays)
+- Caption them with BLIP (`Salesforce/blip-image-captioning-base`)
+- Embed images with CLIP (`openai/clip-vit-base-patch32`, 512-dim)
+- Embed captions with the existing MiniLM encoder (384-dim) into the text collection
+- **Dual-collection architecture**: text chunks (MiniLM 384-dim) + CLIP embeddings (512-dim)
+- At query time: search both collections, fuse with **Reciprocal Rank Fusion** (RRF)
+- Deduplicate by `image_id` (same image can appear from CLIP search AND caption text search)
+- New endpoint `POST /ask-multimodal` alongside existing `POST /ask`
+- Optional vision LLM (`llama-3.2-11b-vision-preview`) with text-only fallback
+- Custom keyword-based evaluation (deterministic, free — no RAGAS for multimodal)
+
+**Critical constraint**: Every change must preserve backward compatibility. All 252
+existing tests must pass after every module. Existing class/function signatures are
+frozen — only ADD new code alongside.
+
+---
+
+## Environment audit
+
+| Package | Status | Version |
+|---|---|---|
+| `transformers` | Already installed | 5.3.0 |
+| `Pillow` | Already installed | 12.0.0 |
+| `torch` | Already installed (CPU) | 2.10.0+cpu |
+| `reportlab` | **Not installed** — needed as dev dep for test PDF generation | — |
+
+GPU: torch reports `CUDA available: False`. The conda env has a CPU-only torch build.
+CLAUDE.md says RTX 3050 6GB is available but prefers CPU. All Phase 2 code will be
+CPU-first; GPU is optional.
+
+---
+
+## Phase 2 build order (10 modules)
+
+| # | Module | Key files | Tests | Depends on |
+|---|---|---|---|---|
+| 0 | Setup | pyproject.toml, config.py, .env.example, conftest.py | ~3 new | None |
+| 1 | Image extraction | `src/ingestion/image_extractor.py` | ~12 | Module 0 |
+| 2 | Image captioning | `src/ingestion/image_captioner.py` | ~10 | Module 1 |
+| 3 | CLIP encoder | `src/embeddings/clip_encoder.py` | ~12 | Module 0 |
+| 4 | Vector store extension | `src/retrieval/vector_store.py` (extend) | ~10 | Module 3 |
+| 5a | RRF fusion | `src/retrieval/fusion.py` | ~9 | Module 4 |
+| 5b | Multimodal pipeline | `src/retrieval/multimodal_pipeline.py` | ~8 | Module 5a |
+| 6a–c | Generation extension | prompt_builder, llm_client, citations (extend) | ~12 | Module 5b |
+| 7 | FastAPI endpoints | app/main.py, app/schemas.py (extend) | ~8 | Module 6c |
+| 8 | Evaluation | `src/evaluation/multimodal_eval.py` | ~8 | Module 7 |
+| 9 | Gradio + ingestion | app/gradio_demo.py (extend), `scripts/ingest_multimodal.py` | ~5 | Module 8 |
+
+**Estimated new tests**: ~87 → total ~339
+
+---
+
+## Module 0 — Setup (Extend Existing Config)
+
+### What changes
+
+| File | Action | What |
+|---|---|---|
+| `pyproject.toml` | Edit | Add `transformers>=4.36.0`, `Pillow>=10.0.0` to runtime; `reportlab>=4.0` to dev |
+| `.env.example` | Edit | Append 7 new env vars for Phase 2 |
+| `.gitignore` | Edit | Append `data/extracted_images/` |
+| `src/config.py` | Edit | Add 7 new fields to `Settings`, update `get_settings()` |
+| `tests/conftest.py` | Edit | Add 5 new fixtures |
+| `tests/test_config.py` | Edit | Add 3 new tests |
+| `data/extracted_images/.gitkeep` | Create | Empty dir marker |
+| `scripts/__init__.py` | Create | Package marker |
+
+### New Settings fields
+
+```python
+# Phase 2 — Multimodal (added after existing fields)
+clip_collection_name: str = "multimodal_clip"
+clip_model: str = "openai/clip-vit-base-patch32"
+caption_model: str = "Salesforce/blip-image-captioning-base"
+vision_llm_model: str = "llama-3.2-11b-vision-preview"
+rrf_k: int = 60
+device: str = "cpu"
+extracted_images_dir: str = "data/extracted_images"
+```
+
+`get_settings()` updates: same `os.environ.get()` pattern. Device auto-detection:
+```python
+try:
+    import torch
+    _cuda = torch.cuda.is_available()
+except ImportError:
+    _cuda = False
+device = os.getenv("DEVICE", "cuda" if _cuda else "cpu")
+```
+
+### New conftest.py fixtures
+
+| Fixture | Returns | Purpose |
+|---|---|---|
+| `sample_image` | 200x200 RGB PIL Image with shapes | Test image for captioning/encoding |
+| `sample_pdf_with_images` | Path to reportlab-generated PDF with embedded image | Test image extraction |
+| `sample_text_chunks` | 3 dicts with text/metadata/score | Reusable test chunks |
+| `temp_image_dir` | `str(tmp_path / "extracted_images")` | Temp output dir |
+| `in_memory_qdrant` | `QdrantClient(":memory:")` | In-process Qdrant for store tests |
+
+### New tests (appended to existing test_config.py)
+
+- `test_config_has_clip_collection_name` — `settings.clip_collection_name == "multimodal_clip"`
+- `test_config_has_caption_model` — `"blip" in settings.caption_model`
+- `test_config_has_device_field` — `isinstance(settings.device, str)`
+
+### Verification
+
+```bash
+pip install -e ".[dev]"   # installs reportlab
+pytest tests/ -v          # 252 old + 3 new = 255 pass
+ruff check src/ app/ tests/
+```
+
+---
+
+## Module 1 — Image Extraction
+
+### File: `src/ingestion/image_extractor.py` (NEW)
+
+### `ExtractedImage` dataclass
+
+```python
+@dataclass
+class ExtractedImage:
+    image_path: str        # relative path to saved PNG
+    source_pdf: str        # PDF filename
+    page_number: int       # 1-based
+    xref: int              # PyMuPDF xref for dedup
+    width: int
+    height: int
+    image_id: str          # f"{pdf_stem}_p{page_num}_x{xref}"
+```
+
+### `ImageExtractor` class
+
+```python
+class ImageExtractor:
+    def __init__(self, output_dir: str) -> None: ...
+    def extract_images_from_pdf(self, pdf_path: str) -> list[ExtractedImage]: ...
+    def extract_images_from_page(self, page: fitz.Page, pdf_path: str, page_num: int) -> list[ExtractedImage]: ...
+    def _save_image(self, image_bytes: bytes, xref: int, pdf_path: str, page_num: int) -> str: ...
+    def _is_valid_image(self, image_bytes: bytes, min_size: tuple[int, int] = (50, 50)) -> bool: ...
+```
+
+**Key logic**:
+- `extract_images_from_pdf`: open PDF with `fitz.open()`, track `seen_xrefs: set[int]`
+  to skip cross-page duplicates, iterate pages, call `extract_images_from_page()`
+- `extract_images_from_page`: `page.get_images(full=True)` → for each `(xref, ...)`
+  tuple, `doc.extract_image(xref)` → validate with `_is_valid_image()` → save with
+  `_save_image()` → return `ExtractedImage`
+- `_save_image`: filename = `{stem}_p{page}_x{xref}.png`, save to `output_dir` with
+  `PIL.Image.open(io.BytesIO(image_bytes)).save(path)`, return relative path
+- `_is_valid_image`: load bytes as PIL Image, check `width >= min_size[0]` and
+  `height >= min_size[1]`, return `False` on any exception
+
+### Tests (~12 in `tests/test_image_extractor.py`)
+
+| Test | What it checks |
+|---|---|
+| `test_extract_from_pdf_with_images` | Uses `sample_pdf_with_images` fixture, returns non-empty list |
+| `test_extract_returns_correct_metadata` | `source_pdf`, `page_number`, `xref` populated |
+| `test_extract_skips_tiny_images` | 10x10 pixel image not in results |
+| `test_extract_handles_no_images` | Text-only PDF → empty list |
+| `test_extract_handles_missing_pdf` | `FileNotFoundError` raised |
+| `test_extract_creates_output_dir` | Dir created if missing |
+| `test_extract_deduplicates_xrefs` | Same xref on multiple pages → one result |
+| `test_save_image_creates_file` | File exists after save |
+| `test_save_image_naming_convention` | Filename matches `{stem}_p{page}_x{xref}.png` |
+| `test_is_valid_image_accepts_large` | 200x200 → True |
+| `test_is_valid_image_rejects_small` | 10x10 → False |
+| `test_extracted_image_dataclass_fields` | All 7 fields present |
+
+### Verification
+
+```bash
+pytest tests/ -v    # 255 + 12 = 267
+```
+
+---
+
+## Module 2 — Image Captioning
+
+### File: `src/ingestion/image_captioner.py` (NEW)
+
+### `CaptionedImage` dataclass
+
+All `ExtractedImage` fields plus:
+```python
+caption: str
+caption_model: str
+```
+
+### `ImageCaptioner` class
+
+```python
+class ImageCaptioner:
+    def __init__(self, model_name: str = "Salesforce/blip-image-captioning-base", device: str = "cpu") -> None: ...
+    def caption_image(self, image: Image.Image | str) -> str: ...
+    def caption_batch(self, images: list, batch_size: int = 8) -> list[str]: ...
+    def caption_extracted_images(self, extracted_images: list[ExtractedImage]) -> list[CaptionedImage]: ...
+```
+
+**Key logic**:
+- `__init__`: load `BlipProcessor` + `BlipForConditionalGeneration` from transformers
+- `caption_image`: if `str` path → `Image.open().convert("RGB")`, process, `model.generate(max_new_tokens=50)`,
+  decode, strip, clean "arafed" prefix (known BLIP artifact)
+- `caption_batch`: process in batches with tqdm progress
+- `caption_extracted_images`: caption each image, return `CaptionedImage` objects
+
+**Test strategy**: BLIP is ~1GB — fast tests mock model/processor. One `@pytest.mark.slow`
+test uses the real model with `sample_image` fixture.
+
+### Tests (~10 in `tests/test_image_captioner.py`)
+
+All mock except the slow integration test. Mock `BlipProcessor` and
+`BlipForConditionalGeneration` — processor returns a mock tensor, model.generate
+returns token IDs, processor.decode returns a canned caption string.
+
+### Verification
+
+```bash
+pytest tests/ -v -k "not slow"    # 267 + 10 = 277 (fast only)
+```
+
+---
+
+## Module 3 — CLIP Encoder
+
+### File: `src/embeddings/clip_encoder.py` (NEW)
+
+Follows the same singleton pattern as `src/embeddings/encoder.py`.
+
+### `CLIPEncoder` class
+
+```python
+class CLIPEncoder:
+    def __init__(self, model_name: str = "openai/clip-vit-base-patch32", device: str = "cpu") -> None: ...
+    def encode_image(self, image: Image.Image | str) -> np.ndarray: ...  # (512,), L2-normed
+    def encode_text(self, text: str) -> np.ndarray: ...                  # (512,), L2-normed
+    def encode_images_batch(self, images: list, batch_size: int = 16) -> list[np.ndarray]: ...
+    def encode_texts_batch(self, texts: list[str], batch_size: int = 32) -> list[np.ndarray]: ...
+    def compute_similarity(self, emb_a: np.ndarray, emb_b: np.ndarray) -> float: ...
+
+_clip_encoder: CLIPEncoder | None = None
+def get_clip_encoder() -> CLIPEncoder: ...
+```
+
+**Key logic**:
+- Uses `CLIPModel` + `CLIPProcessor` from transformers
+- `torch.no_grad()` for all encoding
+- L2 normalize: `embedding / np.linalg.norm(embedding)`
+- `compute_similarity`: dot product (both already L2-normed)
+- Output: numpy `float32` arrays, shape `(512,)`
+
+**Test strategy**: Same mock pattern as Module 2. Mock `CLIPModel` + `CLIPProcessor`.
+One `@pytest.mark.slow` test uses the real model.
+
+### Tests (~12 in `tests/test_clip_encoder.py`)
+
+### Verification
+
+```bash
+pytest tests/ -v -k "not slow"    # 277 + 12 = 289
+```
+
+---
+
+## Module 4 — Vector Store Extension
+
+### File: `src/retrieval/vector_store.py` (EXTEND — add class below existing `QdrantStore`)
+
+### `MultiModalVectorStore(QdrantStore)` — inherits from QdrantStore
+
+```python
+class MultiModalVectorStore(QdrantStore):
+    def __init__(self, host, port, text_collection, clip_collection, _client=None) -> None: ...
+    def create_clip_collection(self, vector_size: int = 512) -> None: ...
+    def upsert_images(self, collection: str, images: list, embeddings: list[np.ndarray]) -> int: ...
+    def upsert_image_captions(self, collection: str, captions: list[dict], embeddings: list[np.ndarray]) -> int: ...
+    def search_clip(self, collection: str, query_vector: np.ndarray, top_k: int = 20) -> list[dict]: ...
+    def get_clip_collection_info(self) -> dict: ...
+    def delete_clip_collection(self) -> None: ...
+
+_mm_store: MultiModalVectorStore | None = None
+def get_multimodal_store() -> MultiModalVectorStore: ...
+```
+
+**Key design decisions**:
+- `__init__` calls `super().__init__(host, port, text_collection, _client)` so all P1
+  methods (upsert_chunks, search, etc.) work on the text collection unchanged
+- `_clip_collection` is stored separately for CLIP-specific operations
+- `upsert_images` payload: `{type: "image", image_id, image_path, caption, source_pdf, page_number, width, height}`
+- `upsert_image_captions` payload: `{type: "image_caption", image_id, text, source_document, page_number, image_path}`
+- All new tests use `QdrantClient(":memory:")` via the `in_memory_qdrant` fixture — no
+  real Qdrant needed
+- Existing `get_store()` is **not modified** — it still returns the P1 `QdrantStore`
+
+### Tests (~10 appended to existing `tests/test_vector_store.py`)
+
+### Verification
+
+```bash
+pytest tests/ -v    # 289 + 10 = 299 (27 existing store tests still pass)
+```
+
+---
+
+## Module 5a — RRF Fusion
+
+### File: `src/retrieval/fusion.py` (NEW)
+
+### `reciprocal_rank_fusion` — pure function
+
+```python
+def reciprocal_rank_fusion(
+    result_lists: list[list[dict]],
+    k: int = 60,
+    top_k: int = 10,
+) -> list[dict]: ...
+```
+
+**Algorithm**:
+1. For each `result_list`, for each result at rank `r` (1-indexed):
+   - key = `result.get("chunk_id") or result.get("image_id") or result["id"]`
+   - `rrf_scores[key] += 1.0 / (k + r)`
+   - Store full metadata (keep version with more fields if duplicate key)
+2. **Deduplication by `image_id`**:
+   - Group all results that share the same `image_id`
+   - Keep entry with highest `rrf_score`
+   - Merge metadata dicts from all hits
+   - Add `retrieval_sources: list[str]` — e.g. `["image", "image_caption"]`
+   - Text-only results (no `image_id`) pass through unchanged
+3. Sort by `rrf_score` descending, return `top_k`
+
+**No classes, no side effects** — a pure function.
+
+### Tests (~9 in `tests/test_fusion.py`)
+
+| Test | What it checks |
+|---|---|
+| `test_rrf_single_list` | Single list → scores assigned correctly |
+| `test_rrf_two_lists_merge` | Two lists → items from both appear |
+| `test_rrf_duplicate_boosted` | Same item in both lists gets higher score |
+| `test_rrf_respects_top_k` | Output length ≤ top_k |
+| `test_rrf_empty_list` | Empty input → empty output |
+| `test_rrf_preserves_metadata` | Metadata fields present in output |
+| `test_rrf_score_decreasing` | Output sorted by rrf_score descending |
+| `test_rrf_deduplicates_by_image_id` | Same image_id from CLIP + caption → one entry |
+| `test_rrf_dedup_merges_metadata` | Merged entry has `retrieval_sources` with both types |
+
+### Verification
+
+```bash
+pytest tests/ -v    # 299 + 9 = 308
+```
+
+---
+
+## Module 5b — Multimodal Retrieval Pipeline
+
+### File: `src/retrieval/multimodal_pipeline.py` (NEW)
+
+### `RetrievalResult` dataclass
+
+```python
+@dataclass
+class RetrievalResult:
+    text_chunks: list[dict]
+    images: list[dict]
+    fusion_scores: dict[str, float]
+    retrieval_time_ms: float
+```
+
+### `MultiModalRetrievalPipeline` class
+
+```python
+class MultiModalRetrievalPipeline:
+    def __init__(self, text_encoder, clip_encoder, store, reranker, config) -> None: ...
+    def retrieve(self, query: str, top_k: int = 5) -> RetrievalResult: ...
+    def _retrieve_text(self, query: str, top_k: int = 20) -> list[dict]: ...
+    def _retrieve_images(self, query: str, top_k: int = 20) -> list[dict]: ...
+    def _classify_results(self, fused: list[dict]) -> tuple[list[dict], list[dict]]: ...
+
+_multimodal_pipeline: MultiModalRetrievalPipeline | None = None
+def get_multimodal_pipeline() -> MultiModalRetrievalPipeline: ...
+```
+
+**Key logic**:
+- `_retrieve_text`: EmbeddingEncoder → QdrantStore.search → CrossEncoderReranker.rerank
+  (reuses the exact P1 flow)
+- `_retrieve_images`: CLIPEncoder.encode_text → store.search_clip (no reranker — CLIP
+  similarity is already cross-modal)
+- `retrieve`: calls both, passes to `reciprocal_rank_fusion()`, then `_classify_results()`
+- `_classify_results`: split by `type` field — `"text"` or missing → `text_chunks`;
+  `"image"` / `"image_caption"` → `images`
+
+### Tests (~8 in `tests/test_multimodal_pipeline.py`) — mock ALL deps
+
+### Verification
+
+```bash
+pytest tests/ -v    # 308 + 8 = 316
+```
+
+---
+
+## Module 6a — Prompt Builder Extension
+
+### File: `src/generation/prompt_builder.py` (EXTEND)
+
+**Add**: `build_multimodal_prompt(query, text_chunks, images) -> str`
+
+Existing `build_prompt()` is **not modified**.
+
+Template structure:
+```
+SYSTEM:
+You are a medical document assistant. Answer questions using ONLY the provided context...
+
+TEXT CONTEXT:
+[1] Source: {source_document} | Page: {page_number}
+{text}
+
+IMAGE DESCRIPTIONS:
+[Img1] Image from: {source_pdf} | Page: {page_number}
+{caption}
+
+QUESTION:
+{query}
+```
+
+Edge cases: omit TEXT CONTEXT if `text_chunks` empty, omit IMAGE DESCRIPTIONS if `images` empty.
+
+### Tests (~5 in `tests/test_multimodal_generation.py` — NEW file)
+
+### Verification
+
+```bash
+pytest tests/ -v    # 316 + 5 = 321
+```
+
+---
+
+## Module 6b — LLM Client Extension
+
+### File: `src/generation/llm_client.py` (EXTEND)
+
+**Add method** to existing `LLMClient` class:
+
+```python
+def generate_with_vision(self, prompt: str, image_paths: list[str], max_images: int = 2) -> str: ...
+```
+
+- Uses `get_settings().vision_llm_model` (`llama-3.2-11b-vision-preview`)
+- Base64-encodes images, builds OpenAI vision content list
+- Calls `self._client.chat.completions.create(model=vision_model, messages=[...], max_tokens=1024)`
+- **Critical**: wraps entire body in `try/except` — on ANY exception, logs warning
+  and falls back to `self.generate(prompt)` (text-only)
+- Vision is a bonus — the demo must work without it
+
+Existing `__init__`, `generate()`, `get_llm_client()` are **not modified**.
+
+### Tests (~4 added to `tests/test_multimodal_generation.py`)
+
+### Verification
+
+```bash
+pytest tests/ -v    # 321 + 4 = 325
+```
+
+---
+
+## Module 6c — Citations Extension
+
+### File: `src/generation/citations.py` (EXTEND)
+
+**Add**: `extract_multimodal_citations(answer, text_chunks, images) -> list[dict]`
+
+Existing `extract_citations()` is **not modified**.
+
+Parses `[Source: X, Page Y]` and `[Image from: X, Page Y]` references from the answer.
+Returns list of dicts with: `claim, source_type, source_document, page_number,
+chunk_text, image_path, image_caption`.
+
+### Tests (~3 added to `tests/test_multimodal_generation.py`)
+
+### Verification
+
+```bash
+pytest tests/ -v    # 325 + 3 = 328
+```
+
+---
+
+## Module 7 — FastAPI Endpoints
+
+### Files: `app/schemas.py` (EXTEND), `app/main.py` (EXTEND)
+
+### New Pydantic models (added to `app/schemas.py`)
+
+```python
+class MultiModalAskRequest(BaseModel):
+    question: str
+    use_vision: bool = False
+    top_k: int = 5
+    include_images: bool = True
+
+class ImageResult(BaseModel):
+    image_id: str
+    image_path: str
+    caption: str
+    source_pdf: str
+    page_number: int
+    relevance_score: float
+
+class MultiModalAskResponse(BaseModel):
+    answer: str
+    text_sources: list[dict]
+    image_sources: list[ImageResult]
+    used_vision_model: bool
+    retrieval_time_ms: float
+    model_version: str
+```
+
+### New endpoints (added to `app/main.py`)
+
+- `POST /ask-multimodal` — uses `MultiModalRetrievalPipeline`, optional vision LLM
+- `GET /images/{image_id}` — serves image files from `data/extracted_images/`
+
+Existing `POST /ask` and `GET /health` are **not modified**.
+
+### Tests (~8 in `tests/test_multimodal_api.py` — NEW file)
+
+Includes `test_existing_ask_still_works` and `test_existing_health_still_works` for
+backward compatibility verification.
+
+### Verification
+
+```bash
+pytest tests/ -v    # 328 + 8 = 336
+```
+
+---
+
+## Module 8 — Evaluation (Custom Metrics, No RAGAS)
+
+### Files: `src/evaluation/multimodal_eval.py` (NEW), `src/evaluation/multimodal_test_queries.json` (NEW)
+
+15 test queries (8 image, 7 text) with `expected_type` and `expected_keywords`.
+
+### `MultiModalEvaluator` class
+
+```python
+class MultiModalEvaluator:
+    def __init__(self, pipeline, test_queries_path) -> None: ...
+    def evaluate_retrieval(self, top_k=5) -> dict: ...
+    def image_retrieval_precision(self, query, result) -> float: ...
+    def text_retrieval_precision(self, query, result) -> float: ...
+    def modality_accuracy(self, query, result) -> float: ...
+    def compare_text_only_vs_multimodal(self) -> dict: ...
+    def generate_report(self, results) -> str: ...  # markdown table
+```
+
+Deterministic, free, no API calls. Keyword matching against retrieved chunk text / captions.
+
+### Tests (~8 in `tests/test_multimodal_eval.py` — NEW file)
+
+### Verification
+
+```bash
+pytest tests/ -v    # 336 + 8 = 344
+```
+
+---
+
+## Module 9 — Gradio + Ingestion Script
+
+### Files: `app/gradio_demo.py` (EXTEND), `scripts/ingest_multimodal.py` (NEW)
+
+### Gradio changes
+
+Add a second tab to `build_demo()`:
+- Tab 1 "Text Q&A" — existing interface, unchanged
+- Tab 2 "Multimodal Q&A" — question input, "Use vision" checkbox, answer output,
+  image gallery, citations JSON
+
+### Ingestion script
+
+CLI with argparse: `python scripts/ingest_multimodal.py --pdf-dir data/raw/ --output-dir data/extracted_images/`
+
+Steps:
+1. Parse PDFs with `parse_pdf()` (reuse P1)
+2. Extract images with `ImageExtractor`
+3. Caption with `ImageCaptioner`
+4. Chunk text (reuse P1 `SentenceChunker`)
+5. Embed text → upsert to text collection
+6. Embed images with CLIP → upsert to CLIP collection
+7. Embed captions with MiniLM → upsert to text collection with `type="image_caption"` + `image_id`
+
+### CI update
+
+Update `.github/workflows/ci.yml` pytest command: `pytest tests/ -v -k "not slow and not integration"`
+
+### Tests (~5 in `tests/test_gradio_multimodal.py` — NEW file)
+
+### Verification
+
+```bash
+pytest tests/ -v -k "not slow"    # 344 + 5 = 349 (all fast tests)
+```
+
+---
+
+## Risks and mitigations
+
+| Risk | Mitigation |
+|---|---|
+| BLIP/CLIP model downloads are large (~1GB each) | Mock in fast tests, `@pytest.mark.slow` for real model tests |
+| torch CPU-only build | All Phase 2 code is CPU-first; `device="cpu"` default |
+| Groq vision model may not support base64 images | `generate_with_vision` has try/except fallback to text-only |
+| `reportlab` not installed | Added as dev dep, installed on `pip install -e ".[dev]"` |
+| Breaking P1 tests | Run full suite after every module; never modify existing signatures |
+| Image dedup complexity | Pure function `reciprocal_rank_fusion` with dedicated dedup tests |
+
+---
+
+## Workflow per module
+
+1. Write code for the module
+2. `ruff check src/ app/ tests/` — zero errors
+3. `pytest tests/ -v -k "not slow"` — all pass (P1 + P2)
+4. **Do NOT commit** — user commits manually
+
+---
+
+## Verification (full suite after Phase 2 complete)
+
+```bash
+# All fast tests
+pytest tests/ -v -k "not slow"
+
+# Including slow model tests (downloads BLIP + CLIP)
+pytest tests/ -v
+
+# Lint
+ruff check src/ app/ tests/
+```

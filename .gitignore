@@ -208,3 +208,4 @@ __marimo__/
 
 # Medical RAG project
 data/raw/*.pdf
+data/extracted_images/
