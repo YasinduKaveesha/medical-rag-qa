@@ -87,3 +87,70 @@ def build_prompt(query: str, chunks: list[dict]) -> str:
         "build_prompt: assembled prompt with %d chunks (%d chars)", len(chunks), len(prompt)
     )
     return prompt
+
+
+_MM_SYSTEM_INSTRUCTION = """\
+You are a medical document assistant. Answer questions using ONLY the provided context.
+If the context is insufficient, say 'I cannot answer from the provided documents.'
+Cite your sources with [Source: document, page X]."""
+
+
+def build_multimodal_prompt(
+    query: str,
+    text_chunks: list[dict],
+    images: list[dict],
+) -> str:
+    """Assemble a multimodal prompt combining text chunks and image descriptions.
+
+    Sections are included conditionally: ``TEXT CONTEXT`` is omitted when
+    *text_chunks* is empty; ``IMAGE DESCRIPTIONS`` is omitted when *images*
+    is empty.
+
+    Args:
+        query: Raw natural-language question string.
+        text_chunks: Flat dicts from
+            :meth:`~src.retrieval.multimodal_pipeline.MultiModalRetrievalPipeline.retrieve`
+            with keys ``"text"``, ``"source_document"``, ``"page_number"``.
+        images: Flat dicts (type ``"image"`` or ``"image_caption"``) with
+            keys ``"caption"``, ``"source_pdf"`` or ``"source_document"``,
+            ``"page_number"``.
+
+    Returns:
+        Formatted prompt string ready to be passed to
+        :meth:`~src.generation.llm_client.LLMClient.generate` or
+        :meth:`~src.generation.llm_client.LLMClient.generate_with_vision`.
+    """
+    parts: list[str] = [_MM_SYSTEM_INSTRUCTION, ""]
+
+    if text_chunks:
+        parts.append("TEXT CONTEXT:")
+        for chunk in text_chunks:
+            source = chunk.get("source_document", chunk.get("source_pdf", "unknown"))
+            page = chunk.get("page_number", "?")
+            text = chunk.get("text", chunk.get("chunk_text", ""))
+            parts.append(f"[Source: {source}, Page {page}]")
+            parts.append(text)
+            parts.append("")
+
+    if images:
+        parts.append("IMAGE DESCRIPTIONS:")
+        for img in images:
+            source = img.get("source_pdf", img.get("source_document", "unknown"))
+            page = img.get("page_number", "?")
+            caption = img.get("caption", img.get("text", ""))
+            parts.append(f"[Image from: {source}, Page {page}]")
+            parts.append(caption)
+            parts.append("")
+
+    parts.append(f"Question: {query}")
+    parts.append("")
+    parts.append("Answer (cite sources, mention relevant images when applicable):")
+
+    prompt = "\n".join(parts)
+    logger.debug(
+        "build_multimodal_prompt: %d text chunks, %d images, %d chars",
+        len(text_chunks),
+        len(images),
+        len(prompt),
+    )
+    return prompt
